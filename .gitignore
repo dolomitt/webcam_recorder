@@ -1,0 +1,26 @@
+# Build output
+bin/
+obj/
+
+# User-specific files
+*.user
+*.rsuser
+*.suo
+
+# IDE/editor folders
+.vs/
+.vscode/
+
+# Logs and temp
+*.log
+*.tmp
+*.temp
+
+# OS files
+Thumbs.db
+Desktop.ini
+
+# Test/coverage artifacts
+TestResults/
+*.trx
+coverage/
