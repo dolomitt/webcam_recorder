@@ -29,6 +29,65 @@ If `dotnet` is not in PATH, use:
 
 ---
 
+## Installation
+
+### 1) Get the source code
+
+Using Git:
+
+```bat
+git clone https://github.com/dolomitt/webcam_recorder.git
+cd webcam_recorder
+```
+
+Or download the project as a ZIP and extract it, then open a terminal in the extracted `webcam_recorder` folder.
+
+### 2) Restore dependencies
+
+```bat
+dotnet restore webcam_recorder.sln
+```
+
+### 3) Build the solution
+
+```bat
+dotnet build webcam_recorder.sln -c Debug
+```
+
+### 4) Configure the app
+
+Edit `appsettings.json` and set:
+
+- `Server.Host` and `Server.Port`
+- `Camera.DeviceName` (your webcam device name)
+- `Recording.OutputDirectory` (where MP4 files are saved)
+
+### 5) Run the server
+
+```bat
+dotnet run --project webcam_recorder.csproj
+```
+
+Server should start on the configured URL (default: `http://localhost:5001/`).
+
+### 6) (Optional) Validate with sample client
+
+Start recording:
+
+```bat
+dotnet run --project SampleClient\SampleClient.csproj -- start test123
+```
+
+Stop recording:
+
+```bat
+dotnet run --project SampleClient\SampleClient.csproj -- stop
+```
+
+Then open `http://localhost:5001/file/test123` to verify the output file is available.
+
+---
+
 ## Project Structure
 
 - `Program.cs` - recorder server
