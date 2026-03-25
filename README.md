@@ -1,17 +1,17 @@
 # webcam_recorder (C#)
 
-Simple command-line HTTP recorder service in C# that wraps `ffmpeg`.
+Simple command-line HTTP webcam service in C# with live preview and MP4 recording.
 
 ## Features
 
 - `POST /start` to start recording webcam video
 - `POST /stop` to stop recording
+- `GET /stream/{id}` to view live MJPEG preview while recording
+- `GET /file/{id}` to download/open saved MP4 recording
 - JSON config for:
-  - camera device name
   - server host/port
-  - capture resolution
-  - output format/extension
-  - ffmpeg executable path
+  - camera device name
+  - output directory
 - Sample client app included (`SampleClient`)
 
 ---
@@ -19,8 +19,9 @@ Simple command-line HTTP recorder service in C# that wraps `ffmpeg`.
 ## Requirements
 
 - Windows
-- .NET SDK (tested with .NET 10)
-- ffmpeg installed (or unpacked) locally
+- .NET SDK (current solution targets `net452`)
+- .NET Framework 4.5.2 targeting pack/runtime on the machine
+- A webcam available on Windows
 
 If `dotnet` is not in PATH, use:
 
@@ -34,6 +35,7 @@ If `dotnet` is not in PATH, use:
 - `webcam_recorder.csproj` - server project file
 - `appsettings.json` - server configuration
 - `SampleClient/Program.cs` - sample REST client
+- `SampleClient/SampleClient.csproj` - sample client project file
 
 ---
 
@@ -48,34 +50,26 @@ Edit `appsettings.json`:
     "Port": 5001
   },
   "Camera": {
-    "InputFormat": "dshow",
-    "DeviceName": "Integrated Webcam",
-    "Resolution": "1280x720"
+    "DeviceName": "Integrated Webcam"
   },
   "Recording": {
-    "OutputDirectory": "C:\\videos",
-    "FileExtension": "mp4",
-    "OutputFormat": "mp4"
-  },
-  "Ffmpeg": {
-    "ExecutablePath": "C:\\Tools\\ffmpeg\\bin\\ffmpeg.exe"
+    "OutputDirectory": "C:\\videos"
   }
 }
 ```
 
 ### Notes
 
-- `DeviceName` must match your DirectShow camera name.
+- `Camera.DeviceName` should match your DirectShow camera name. If not found, the first available camera is used.
 - If a port is busy, change `Server.Port`.
-- Recordings are saved to `Recording.OutputDirectory`.
+- Recordings are saved to `Recording.OutputDirectory` with `.mp4` extension.
 
 ---
 
 ## Build
 
 ```bat
-C:\Progra~1\dotnet\dotnet.exe build webcam_recorder.csproj -nologo
-C:\Progra~1\dotnet\dotnet.exe build SampleClient\SampleClient.csproj -nologo
+dotnet build webcam_recorder.sln -nologo
 ```
 
 ---
@@ -83,7 +77,7 @@ C:\Progra~1\dotnet\dotnet.exe build SampleClient\SampleClient.csproj -nologo
 ## Run Server
 
 ```bat
-C:\Progra~1\dotnet\dotnet.exe run --project webcam_recorder.csproj
+dotnet run --project webcam_recorder.csproj
 ```
 
 Server starts on the configured URL, e.g.:
@@ -104,10 +98,14 @@ Body:
 { "id": "my-recording" }
 ```
 
-Response:
+Success response (example):
 
 ```json
-{ "file": "C:\\videos\\my-recording.mp4" }
+{
+  "file": "C:\\videos\\my-recording.mp4",
+  "stream": "/stream/my-recording",
+  "download": "/file/my-recording"
+}
 ```
 
 ### Stop recording
@@ -120,6 +118,26 @@ Response:
 { "status": "stopped" }
 ```
 
+### Stream live preview
+
+**GET** `/stream/{id}`
+
+Example:
+
+`http://localhost:5001/stream/my-recording`
+
+Returns a live MJPEG stream while that recording ID is active.
+
+### Download recording
+
+**GET** `/file/{id}`
+
+Example:
+
+`http://localhost:5001/file/my-recording`
+
+Returns the saved MP4 file.
+
 ---
 
 ## Sample Client
@@ -127,13 +145,13 @@ Response:
 Start:
 
 ```bat
-C:\Progra~1\dotnet\dotnet.exe run --project SampleClient\SampleClient.csproj -- start test123
+dotnet run --project SampleClient\SampleClient.csproj -- start test123
 ```
 
 Stop:
 
 ```bat
-C:\Progra~1\dotnet\dotnet.exe run --project SampleClient\SampleClient.csproj -- stop
+dotnet run --project SampleClient\SampleClient.csproj -- stop
 ```
 
 ---
@@ -144,9 +162,5 @@ C:\Progra~1\dotnet\dotnet.exe run --project SampleClient\SampleClient.csproj -- 
   - Error: `Failed to listen on prefix... conflicts with an existing registration`
   - Fix: change `Server.Port` in `appsettings.json`.
 
-- **ffmpeg not found**
-  - Set full path in `Ffmpeg.ExecutablePath`.
-
-- **Unplayable mp4 (`moov atom not found`)**
-  - This happens if ffmpeg is terminated abruptly.
-  - Use `/stop` to stop gracefully so container metadata is finalized.
+- **No webcam found**
+  - Ensure a camera is connected and recognized by Windows.

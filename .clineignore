@@ -1,0 +1,27 @@
+# Git and IDE metadata
+.git/
+.vs/
+.vscode/
+
+# Build artifacts (all projects)
+**/bin/
+**/obj/
+
+# Test and coverage output
+TestResults/
+**/TestResults/
+coverage/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# User-specific files
+*.user
+*.rsuser
+*.suo
+
+# OS-generated files
+Thumbs.db
+Desktop.ini

@@ -1,313 +1,364 @@
+using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
 using System.Net;
 using System.Text;
-using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
+using Accord.Video.FFMPEG;
+using AForge.Video;
+using AForge.Video.DirectShow;
 
-// Simple command-line HTTP server that exposes:
-// POST /start { "id": "123" }
-// POST /stop
-//
-// Settings are read from appsettings.json.
-
-var config = await LoadConfigAsync("appsettings.json");
-
-var prefix = $"http://{config.Server.Host}:{config.Server.Port}/";
-
-var listener = new HttpListener();
-listener.Prefixes.Add(prefix);
-
-Process? ffmpegProcess = null;
-var processLock = new object();
-
-try
+public class Program
 {
-    listener.Start();
-}
-catch (HttpListenerException ex)
-{
-    Console.WriteLine($"Failed to start listener on {prefix}");
-    Console.WriteLine(ex.Message);
-    Console.WriteLine("Tip: ensure no other process is already using this URL/port.");
-    return;
-}
+    static AppConfig config;
+    static HttpListener listener;
+    static readonly object sync = new object();
+    static VideoCaptureDevice videoDevice;
+    static Bitmap latestFrame;
+    static string activeId = string.Empty;
+    static string currentRecordingPath = string.Empty;
+    static volatile bool isRecording;
+    static VideoFileWriter videoWriter;
+    static int frameWidth;
+    static int frameHeight;
+    static int frameRate = 30;
 
-Console.WriteLine($"Server running on {prefix}");
-Console.WriteLine("Press Ctrl+C to stop.");
-
-Console.CancelKeyPress += (_, e) =>
-{
-    e.Cancel = true;
-    Console.WriteLine("Shutting down...");
-
-    listener.Stop();
-
-    lock (processLock)
+    public static void Main(string[] args)
     {
-        if (ffmpegProcess is { HasExited: false })
+        RunAsync().GetAwaiter().GetResult();
+    }
+
+    static async Task RunAsync()
+    {
+        config = LoadConfig("appsettings.json");
+        var prefix = string.Format("http://{0}:{1}/", config.Server.Host, config.Server.Port);
+
+        listener = new HttpListener();
+        listener.Prefixes.Add(prefix);
+        listener.Start();
+
+        Console.CancelKeyPress += delegate(object sender, ConsoleCancelEventArgs e)
         {
+            e.Cancel = true;
+            StopCapture();
+            try { listener.Stop(); } catch { }
+        };
+
+        Console.WriteLine("Server running on {0}", prefix);
+
+        while (true)
+        {
+            HttpListenerContext context;
             try
             {
-                ffmpegProcess.Kill(entireProcessTree: true);
+                context = await listener.GetContextAsync();
             }
             catch
             {
-                // Best-effort shutdown
+                break;
             }
+
+            _ = Task.Run(() => HandleRequestAsync(context));
         }
     }
 
-    Environment.Exit(0);
-};
-
-while (true)
-{
-    HttpListenerContext context;
-    try
+    static async Task HandleRequestAsync(HttpListenerContext context)
     {
-        context = await listener.GetContextAsync();
-    }
-    catch (HttpListenerException)
-    {
-        // Listener stopped
-        break;
-    }
-    catch (ObjectDisposedException)
-    {
-        break;
-    }
+        var req = context.Request;
+        var res = context.Response;
 
-    _ = Task.Run(async () =>
-    {
-        try
+        if (req.HttpMethod == "POST" && req.Url.AbsolutePath == "/start")
         {
-            await HandleRequestAsync(context);
-        }
-        catch (Exception ex)
-        {
-            await WriteJsonAsync(context.Response, 500, new { error = ex.Message });
-        }
-    });
-}
-
-async Task HandleRequestAsync(HttpListenerContext context)
-{
-    var request = context.Request;
-    var response = context.Response;
-
-    if (request.HttpMethod == "POST" && request.Url?.AbsolutePath == "/start")
-    {
-        using var reader = new StreamReader(request.InputStream, request.ContentEncoding);
-        var body = await reader.ReadToEndAsync();
-
-        string? id;
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            id = doc.RootElement.TryGetProperty("id", out var idProp) ? idProp.GetString() : null;
-        }
-        catch
-        {
-            await WriteJsonAsync(response, 400, new { error = "Invalid JSON body" });
-            return;
-        }
-
-        if (string.IsNullOrWhiteSpace(id))
-        {
-            await WriteJsonAsync(response, 400, new { error = "'id' is required" });
-            return;
-        }
-
-        // Basic filename safety for id
-        foreach (var invalid in Path.GetInvalidFileNameChars())
-        {
-            if (id.Contains(invalid))
+            var body = new StreamReader(req.InputStream, req.ContentEncoding).ReadToEnd();
+            Dictionary<string, object> payload;
+            try
             {
-                await WriteJsonAsync(response, 400, new { error = "'id' contains invalid filename characters" });
+                payload = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(body);
+            }
+            catch
+            {
+                await WriteJsonAsync(res, 400, Dict("error", "Invalid JSON body"));
                 return;
             }
-        }
 
-        var videosDir = config.Recording.OutputDirectory;
-        Directory.CreateDirectory(videosDir);
-        var extension = config.Recording.FileExtension.TrimStart('.');
-        var path = Path.Combine(videosDir, $"{id}.{extension}");
-
-        lock (processLock)
-        {
-            if (ffmpegProcess is { HasExited: false })
+            var id = payload.ContainsKey("id") ? Convert.ToString(payload["id"]) : null;
+            if (string.IsNullOrWhiteSpace(id))
             {
-                ffmpegProcess.Kill(entireProcessTree: true);
-                ffmpegProcess.WaitForExit(2000);
+                await WriteJsonAsync(res, 400, Dict("error", "'id' is required"));
+                return;
             }
 
-            var startInfo = new ProcessStartInfo
+            foreach (var invalid in Path.GetInvalidFileNameChars())
             {
-                FileName = config.Ffmpeg.ExecutablePath,
-                UseShellExecute = false,
-                RedirectStandardInput = true,
-                RedirectStandardError = false,
-                RedirectStandardOutput = false,
-                CreateNoWindow = true
-            };
-
-            startInfo.ArgumentList.Add("-f");
-            startInfo.ArgumentList.Add(config.Camera.InputFormat);
-
-            if (!string.IsNullOrWhiteSpace(config.Camera.Resolution))
-            {
-                startInfo.ArgumentList.Add("-video_size");
-                startInfo.ArgumentList.Add(config.Camera.Resolution);
-            }
-
-            startInfo.ArgumentList.Add("-i");
-            startInfo.ArgumentList.Add($"video={config.Camera.DeviceName}");
-
-            if (!string.IsNullOrWhiteSpace(config.Recording.OutputFormat))
-            {
-                startInfo.ArgumentList.Add("-f");
-                startInfo.ArgumentList.Add(config.Recording.OutputFormat);
-            }
-
-            if (!string.IsNullOrWhiteSpace(config.Recording.VideoCodec))
-            {
-                startInfo.ArgumentList.Add("-c:v");
-                startInfo.ArgumentList.Add(config.Recording.VideoCodec);
-            }
-
-            if (!string.IsNullOrWhiteSpace(config.Recording.PixelFormat))
-            {
-                startInfo.ArgumentList.Add("-pix_fmt");
-                startInfo.ArgumentList.Add(config.Recording.PixelFormat);
-            }
-
-            if (config.Recording.FastStart)
-            {
-                startInfo.ArgumentList.Add("-movflags");
-                startInfo.ArgumentList.Add("+faststart");
-            }
-
-            startInfo.ArgumentList.Add(path);
-
-            ffmpegProcess = Process.Start(startInfo)
-                ?? throw new InvalidOperationException("Failed to start ffmpeg");
-        }
-
-        await WriteJsonAsync(response, 200, new { file = path });
-        return;
-    }
-
-    if (request.HttpMethod == "POST" && request.Url?.AbsolutePath == "/stop")
-    {
-        lock (processLock)
-        {
-            if (ffmpegProcess is { HasExited: false })
-            {
-                try
+                if (id.IndexOf(invalid) >= 0)
                 {
-                    ffmpegProcess.StandardInput.WriteLine("q");
-                    ffmpegProcess.StandardInput.Flush();
-                    if (!ffmpegProcess.WaitForExit(5000))
+                    await WriteJsonAsync(res, 400, Dict("error", "'id' contains invalid filename characters"));
+                    return;
+                }
+            }
+
+            Directory.CreateDirectory(config.Recording.OutputDirectory);
+            var recordingPath = Path.Combine(config.Recording.OutputDirectory, id + ".mp4");
+
+            try
+            {
+                StartCapture(id, recordingPath);
+            }
+            catch (Exception ex)
+            {
+                await WriteJsonAsync(res, 500, Dict("error", ex.Message));
+                return;
+            }
+
+            await WriteJsonAsync(res, 200, Dict("file", recordingPath, "stream", "/stream/" + id, "download", "/file/" + id));
+            return;
+        }
+
+        if (req.HttpMethod == "POST" && req.Url.AbsolutePath == "/stop")
+        {
+            StopCapture();
+            await WriteJsonAsync(res, 200, Dict("status", "stopped"));
+            return;
+        }
+
+        if (req.HttpMethod == "GET" && req.Url.AbsolutePath.StartsWith("/stream/", StringComparison.OrdinalIgnoreCase))
+        {
+            var id = req.Url.AbsolutePath.Substring("/stream/".Length);
+            if (!string.Equals(id, activeId, StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteJsonAsync(res, 404, Dict("error", "Live preview not running"));
+                return;
+            }
+
+            res.StatusCode = 200;
+            res.ContentType = "multipart/x-mixed-replace; boundary=frame";
+            res.SendChunked = true;
+
+            while (res.OutputStream.CanWrite && string.Equals(id, activeId, StringComparison.OrdinalIgnoreCase))
+            {
+                byte[] jpegBytes = null;
+                lock (sync)
+                {
+                    if (latestFrame != null)
                     {
-                        ffmpegProcess.Kill(entireProcessTree: true);
-                        ffmpegProcess.WaitForExit(2000);
+                        using (var ms = new MemoryStream())
+                        {
+                            latestFrame.Save(ms, ImageFormat.Jpeg);
+                            jpegBytes = ms.ToArray();
+                        }
                     }
                 }
-                catch
+
+                if (jpegBytes != null)
                 {
-                    ffmpegProcess.Kill(entireProcessTree: true);
-                    ffmpegProcess.WaitForExit(2000);
+                    var header = Encoding.ASCII.GetBytes("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + jpegBytes.Length + "\r\n\r\n");
+                    await res.OutputStream.WriteAsync(header, 0, header.Length);
+                    await res.OutputStream.WriteAsync(jpegBytes, 0, jpegBytes.Length);
+                    var crlf = Encoding.ASCII.GetBytes("\r\n");
+                    await res.OutputStream.WriteAsync(crlf, 0, crlf.Length);
+                    await res.OutputStream.FlushAsync();
                 }
+
+                await Task.Delay(100);
             }
+
+            return;
         }
 
-        await WriteJsonAsync(response, 200, new { status = "stopped" });
-        return;
+        if (req.HttpMethod == "GET" && req.Url.AbsolutePath.StartsWith("/file/", StringComparison.OrdinalIgnoreCase))
+        {
+            var id = req.Url.AbsolutePath.Substring("/file/".Length);
+            var path = Path.Combine(config.Recording.OutputDirectory, id + ".mp4");
+            if (!File.Exists(path))
+            {
+                await WriteJsonAsync(res, 404, Dict("error", "Recording not found"));
+                return;
+            }
+
+            res.StatusCode = 200;
+            res.ContentType = "video/mp4";
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                res.ContentLength64 = fs.Length;
+                await fs.CopyToAsync(res.OutputStream);
+            }
+            res.OutputStream.Close();
+            return;
+        }
+
+        await WriteJsonAsync(res, 404, Dict("error", "Not found"));
     }
 
-    await WriteJsonAsync(response, 404, new { error = "Not found" });
-}
-
-static async Task WriteJsonAsync(HttpListenerResponse response, int statusCode, object payload)
-{
-    response.StatusCode = statusCode;
-    response.ContentType = "application/json";
-
-    var json = JsonSerializer.Serialize(payload);
-    var buffer = Encoding.UTF8.GetBytes(json);
-    response.ContentLength64 = buffer.Length;
-
-    await response.OutputStream.WriteAsync(buffer);
-    response.OutputStream.Close();
-}
-
-static async Task<AppConfig> LoadConfigAsync(string path)
-{
-    if (!File.Exists(path))
+    static void StartCapture(string id, string recordingPath)
     {
-        throw new FileNotFoundException($"Missing config file: {path}");
+        StopCapture();
+
+        var devices = new FilterInfoCollection(FilterCategory.VideoInputDevice);
+        if (devices.Count == 0)
+        {
+            throw new InvalidOperationException("No webcam found.");
+        }
+
+        FilterInfo selected = null;
+        foreach (FilterInfo device in devices)
+        {
+            if (string.Equals(device.Name, config.Camera.DeviceName, StringComparison.OrdinalIgnoreCase))
+            {
+                selected = device;
+                break;
+            }
+        }
+        if (selected == null) selected = devices[0];
+
+        videoDevice = new VideoCaptureDevice(selected.MonikerString);
+        videoDevice.NewFrame += delegate(object sender, NewFrameEventArgs eventArgs)
+        {
+            var frame = (Bitmap)eventArgs.Frame.Clone();
+            lock (sync)
+            {
+                if (frameWidth == 0 || frameHeight == 0)
+                {
+                    frameWidth = frame.Width;
+                    frameHeight = frame.Height;
+                }
+
+                if (latestFrame != null) latestFrame.Dispose();
+                latestFrame = (Bitmap)frame.Clone();
+                if (isRecording)
+                {
+                    EnsureWriter();
+                    if (videoWriter != null)
+                    {
+                        videoWriter.WriteVideoFrame(latestFrame);
+                    }
+                }
+            }
+            frame.Dispose();
+        };
+
+        activeId = id;
+        currentRecordingPath = recordingPath;
+        isRecording = true;
+        videoDevice.Start();
     }
 
-    var json = await File.ReadAllTextAsync(path);
-    var config = JsonSerializer.Deserialize<AppConfig>(json, new JsonSerializerOptions
+    static void StopCapture()
     {
-        PropertyNameCaseInsensitive = true
-    });
+        isRecording = false;
+        activeId = string.Empty;
+        currentRecordingPath = string.Empty;
 
-    if (config is null)
-    {
-        throw new InvalidOperationException("Invalid configuration. Could not deserialize appsettings.json");
+        if (videoDevice != null)
+        {
+            try
+            {
+                if (videoDevice.IsRunning)
+                {
+                    videoDevice.SignalToStop();
+                    videoDevice.WaitForStop();
+                }
+            }
+            catch { }
+
+            videoDevice = null;
+        }
+
+        if (videoWriter != null)
+        {
+            try { videoWriter.Close(); } catch { }
+            videoWriter.Dispose();
+            videoWriter = null;
+        }
+
+        frameWidth = 0;
+        frameHeight = 0;
+
+        lock (sync)
+        {
+            if (latestFrame != null)
+            {
+                latestFrame.Dispose();
+                latestFrame = null;
+            }
+        }
     }
 
-    if (string.IsNullOrWhiteSpace(config.Camera.DeviceName))
+    static void EnsureWriter()
     {
-        throw new InvalidOperationException("Configuration error: Camera.DeviceName is required.");
+        try
+        {
+            if (videoWriter == null && !string.IsNullOrWhiteSpace(currentRecordingPath) && frameWidth > 0 && frameHeight > 0)
+            {
+                videoWriter = new VideoFileWriter();
+                videoWriter.Open(currentRecordingPath, frameWidth, frameHeight, frameRate, VideoCodec.MPEG4);
+            }
+        }
+        catch { }
     }
 
-    if (string.IsNullOrWhiteSpace(config.Recording.FileExtension))
+    static async Task WriteJsonAsync(HttpListenerResponse response, int statusCode, object payload)
     {
-        throw new InvalidOperationException("Configuration error: Recording.FileExtension is required.");
+        response.StatusCode = statusCode;
+        response.ContentType = "application/json";
+        var json = new JavaScriptSerializer().Serialize(payload);
+        var buffer = Encoding.UTF8.GetBytes(json);
+        response.ContentLength64 = buffer.Length;
+        await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+        response.OutputStream.Close();
     }
 
-    if (config.Server.Port < 1 || config.Server.Port > 65535)
+    static object Dict(string k1, object v1) { return new Dictionary<string, object> { { k1, v1 } }; }
+    static object Dict(string k1, object v1, string k2, object v2, string k3, object v3) { return new Dictionary<string, object> { { k1, v1 }, { k2, v2 }, { k3, v3 } }; }
+
+    static AppConfig LoadConfig(string path)
     {
-        throw new InvalidOperationException("Configuration error: Server.Port must be between 1 and 65535.");
+        var serializer = new JavaScriptSerializer();
+        var root = serializer.Deserialize<Dictionary<string, object>>(File.ReadAllText(path));
+        var cfg = new AppConfig();
+        cfg.Server.Host = GetString(root, "Server", "Host", "localhost");
+        cfg.Server.Port = GetInt(root, "Server", "Port", 5000);
+        cfg.Camera.DeviceName = GetString(root, "Camera", "DeviceName", "Integrated Webcam");
+        cfg.Recording.OutputDirectory = GetString(root, "Recording", "OutputDirectory", @"C:\videos");
+        return cfg;
     }
 
-    return config;
+    static string GetString(Dictionary<string, object> root, string section, string key, string defaultValue)
+    {
+        var sec = GetSection(root, section);
+        if (sec != null && sec.ContainsKey(key) && sec[key] != null) return Convert.ToString(sec[key]);
+        return defaultValue;
+    }
+
+    static int GetInt(Dictionary<string, object> root, string section, string key, int defaultValue)
+    {
+        var sec = GetSection(root, section);
+        if (sec != null && sec.ContainsKey(key) && sec[key] != null)
+        {
+            int n;
+            if (int.TryParse(Convert.ToString(sec[key]), out n)) return n;
+        }
+        return defaultValue;
+    }
+
+    static Dictionary<string, object> GetSection(Dictionary<string, object> root, string section)
+    {
+        if (root != null && root.ContainsKey(section) && root[section] is Dictionary<string, object>) return (Dictionary<string, object>)root[section];
+        return null;
+    }
 }
 
-sealed class AppConfig
+public class AppConfig
 {
-    public ServerConfig Server { get; set; } = new();
-    public CameraConfig Camera { get; set; } = new();
-    public RecordingConfig Recording { get; set; } = new();
-    public FfmpegConfig Ffmpeg { get; set; } = new();
+    public ServerConfig Server = new ServerConfig();
+    public CameraConfig Camera = new CameraConfig();
+    public RecordingConfig Recording = new RecordingConfig();
 }
 
-sealed class ServerConfig
-{
-    public string Host { get; set; } = "localhost";
-    public int Port { get; set; } = 5000;
-}
-
-sealed class CameraConfig
-{
-    public string InputFormat { get; set; } = "dshow";
-    public string DeviceName { get; set; } = "HD Webcam";
-    public string Resolution { get; set; } = "1280x720";
-}
-
-sealed class RecordingConfig
-{
-    public string OutputDirectory { get; set; } = @"C:\videos";
-    public string FileExtension { get; set; } = "mp4";
-    public string? OutputFormat { get; set; }
-    public string VideoCodec { get; set; } = "libx264";
-    public string PixelFormat { get; set; } = "yuv420p";
-    public bool FastStart { get; set; } = true;
-}
-
-sealed class FfmpegConfig
-{
-    public string ExecutablePath { get; set; } = "ffmpeg";
-}
+public class ServerConfig { public string Host = "localhost"; public int Port = 5000; }
+public class CameraConfig { public string DeviceName = "Integrated Webcam"; }
+public class RecordingConfig { public string OutputDirectory = @"C:\videos"; }
