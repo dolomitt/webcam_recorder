@@ -27,6 +27,10 @@ public class Program
     static int frameWidth;
     static int frameHeight;
     static int frameRate = 30;
+    static CancellationTokenSource ftpSyncCts;
+    static Task ftpSyncTask;
+    static readonly object logSync = new object();
+    static string logFilePath;
 
     public static void Main(string[] args)
     {
@@ -35,21 +39,24 @@ public class Program
 
     static async Task RunAsync()
     {
+        InitializeLogging();
         config = LoadConfig("appsettings.json");
         var prefix = string.Format("http://{0}:{1}/", config.Server.Host, config.Server.Port);
 
         listener = new HttpListener();
         listener.Prefixes.Add(prefix);
         listener.Start();
+        StartFtpSyncLoop();
 
         Console.CancelKeyPress += delegate(object sender, ConsoleCancelEventArgs e)
         {
             e.Cancel = true;
+            StopFtpSyncLoop();
             StopCapture();
             try { listener.Stop(); } catch { }
         };
 
-        Console.WriteLine("Server running on {0}", prefix);
+        Log("Server running on {0}", prefix);
 
         while (true)
         {
@@ -288,6 +295,197 @@ public class Program
         }
     }
 
+    static void StartFtpSyncLoop()
+    {
+        if (config.Ftp == null || !config.Ftp.Enabled)
+        {
+            Log("FTP sync disabled.");
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(config.Ftp.Host))
+        {
+            Log("FTP sync disabled: Ftp.Host is empty.");
+            return;
+        }
+
+        ftpSyncCts = new CancellationTokenSource();
+        ftpSyncTask = Task.Run(() => RunFtpSyncLoopAsync(ftpSyncCts.Token));
+        Log("FTP sync enabled. Checking every {0} minute(s).", config.Ftp.CheckIntervalMinutes);
+    }
+
+    static void StopFtpSyncLoop()
+    {
+        if (ftpSyncCts == null) return;
+
+        try
+        {
+            ftpSyncCts.Cancel();
+            if (ftpSyncTask != null)
+            {
+                ftpSyncTask.Wait(TimeSpan.FromSeconds(5));
+            }
+        }
+        catch { }
+        finally
+        {
+            ftpSyncCts.Dispose();
+            ftpSyncCts = null;
+            ftpSyncTask = null;
+        }
+    }
+
+    static async Task RunFtpSyncLoopAsync(CancellationToken token)
+    {
+        var intervalMinutes = config.Ftp.CheckIntervalMinutes < 1 ? 5 : config.Ftp.CheckIntervalMinutes;
+        var delay = TimeSpan.FromMinutes(intervalMinutes);
+
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                SyncVideosToFtp();
+            }
+            catch (Exception ex)
+            {
+                Log("FTP sync cycle failed: {0}", ex.Message);
+            }
+
+            try
+            {
+                await Task.Delay(delay, token);
+            }
+            catch (TaskCanceledException)
+            {
+                break;
+            }
+        }
+    }
+
+    static void SyncVideosToFtp()
+    {
+        if (!Directory.Exists(config.Recording.OutputDirectory))
+        {
+            Log("FTP sync: local output directory not found: {0}", config.Recording.OutputDirectory);
+            return;
+        }
+
+        HashSet<string> remoteFiles;
+        try
+        {
+            remoteFiles = ListRemoteFiles();
+        }
+        catch (Exception ex)
+        {
+            Log("FTP sync: server unavailable ({0})", ex.Message);
+            return;
+        }
+
+        var localFiles = Directory.GetFiles(config.Recording.OutputDirectory, "*.mp4");
+        var uploadedCount = 0;
+        foreach (var localFile in localFiles)
+        {
+            if (IsActiveRecordingFile(localFile)) continue;
+
+            var fileName = Path.GetFileName(localFile);
+            if (remoteFiles.Contains(fileName)) continue;
+
+            try
+            {
+                UploadFileToFtp(localFile, fileName);
+                uploadedCount++;
+                Log("FTP sync: uploaded {0}", fileName);
+            }
+            catch (Exception ex)
+            {
+                Log("FTP sync: failed uploading {0} ({1})", fileName, ex.Message);
+            }
+        }
+
+        Log("FTP sync cycle complete. Uploaded {0} file(s).", uploadedCount);
+    }
+
+    static bool IsActiveRecordingFile(string path)
+    {
+        if (!isRecording) return false;
+        if (string.IsNullOrWhiteSpace(currentRecordingPath)) return false;
+        return string.Equals(
+            Path.GetFullPath(path).TrimEnd('\\'),
+            Path.GetFullPath(currentRecordingPath).TrimEnd('\\'),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    static HashSet<string> ListRemoteFiles()
+    {
+        var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var request = CreateFtpRequest(string.Empty, WebRequestMethods.Ftp.ListDirectory);
+        using (var response = (FtpWebResponse)request.GetResponse())
+        using (var stream = response.GetResponseStream())
+        using (var reader = new StreamReader(stream))
+        {
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                line = line.Trim();
+                if (line.Length > 0)
+                {
+                    files.Add(line);
+                }
+            }
+        }
+        return files;
+    }
+
+    static void UploadFileToFtp(string localPath, string remoteFileName)
+    {
+        var request = CreateFtpRequest(remoteFileName, WebRequestMethods.Ftp.UploadFile);
+        var bytes = File.ReadAllBytes(localPath);
+        request.ContentLength = bytes.Length;
+        using (var requestStream = request.GetRequestStream())
+        {
+            requestStream.Write(bytes, 0, bytes.Length);
+        }
+        using (var response = (FtpWebResponse)request.GetResponse())
+        {
+            if ((int)response.StatusCode >= 400)
+            {
+                throw new InvalidOperationException(response.StatusDescription);
+            }
+        }
+    }
+
+    static FtpWebRequest CreateFtpRequest(string remoteFileName, string method)
+    {
+        var uri = BuildFtpUri(remoteFileName);
+        var request = (FtpWebRequest)WebRequest.Create(uri);
+        request.Method = method;
+        request.Credentials = new NetworkCredential(config.Ftp.Username, config.Ftp.Password);
+        request.EnableSsl = config.Ftp.UseSsl;
+        request.UseBinary = true;
+        request.UsePassive = true;
+        request.KeepAlive = false;
+        request.Timeout = config.Ftp.TimeoutSeconds * 1000;
+        request.ReadWriteTimeout = config.Ftp.TimeoutSeconds * 1000;
+        return request;
+    }
+
+    static string BuildFtpUri(string remoteFileName)
+    {
+        var basePath = (config.Ftp.RemoteDirectory ?? string.Empty).Trim();
+        basePath = basePath.Trim('/');
+        var cleanFileName = (remoteFileName ?? string.Empty).Trim().Trim('/');
+
+        var uri = string.Format("ftp://{0}:{1}", config.Ftp.Host, config.Ftp.Port);
+        if (!string.IsNullOrEmpty(basePath))
+        {
+            uri += "/" + basePath;
+        }
+        if (!string.IsNullOrEmpty(cleanFileName))
+        {
+            uri += "/" + cleanFileName;
+        }
+        return uri;
+    }
+
     static void EnsureWriter()
     {
         try
@@ -324,6 +522,15 @@ public class Program
         cfg.Server.Port = GetInt(root, "Server", "Port", 5000);
         cfg.Camera.DeviceName = GetString(root, "Camera", "DeviceName", "Integrated Webcam");
         cfg.Recording.OutputDirectory = GetString(root, "Recording", "OutputDirectory", @"C:\videos");
+        cfg.Ftp.Enabled = GetBool(root, "Ftp", "Enabled", false);
+        cfg.Ftp.Host = GetString(root, "Ftp", "Host", string.Empty);
+        cfg.Ftp.Port = GetInt(root, "Ftp", "Port", 21);
+        cfg.Ftp.Username = GetString(root, "Ftp", "Username", "anonymous");
+        cfg.Ftp.Password = GetString(root, "Ftp", "Password", string.Empty);
+        cfg.Ftp.RemoteDirectory = GetString(root, "Ftp", "RemoteDirectory", string.Empty);
+        cfg.Ftp.UseSsl = GetBool(root, "Ftp", "UseSsl", false);
+        cfg.Ftp.CheckIntervalMinutes = GetInt(root, "Ftp", "CheckIntervalMinutes", 5);
+        cfg.Ftp.TimeoutSeconds = GetInt(root, "Ftp", "TimeoutSeconds", 15);
         return cfg;
     }
 
@@ -345,10 +552,49 @@ public class Program
         return defaultValue;
     }
 
+    static bool GetBool(Dictionary<string, object> root, string section, string key, bool defaultValue)
+    {
+        var sec = GetSection(root, section);
+        if (sec != null && sec.ContainsKey(key) && sec[key] != null)
+        {
+            bool b;
+            if (bool.TryParse(Convert.ToString(sec[key]), out b)) return b;
+        }
+        return defaultValue;
+    }
+
     static Dictionary<string, object> GetSection(Dictionary<string, object> root, string section)
     {
         if (root != null && root.ContainsKey(section) && root[section] is Dictionary<string, object>) return (Dictionary<string, object>)root[section];
         return null;
+    }
+
+    static void InitializeLogging()
+    {
+        var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+        var logDir = Path.Combine(baseDir, "logs");
+        Directory.CreateDirectory(logDir);
+        logFilePath = Path.Combine(logDir, "server_run.log");
+    }
+
+    static void Log(string format, params object[] args)
+    {
+        var message = args == null || args.Length == 0 ? format : string.Format(format, args);
+        var line = string.Format("{0:yyyy-MM-dd HH:mm:ss.fff} {1}", DateTime.Now, message);
+        Console.WriteLine(line);
+
+        if (string.IsNullOrWhiteSpace(logFilePath)) return;
+        try
+        {
+            lock (logSync)
+            {
+                File.AppendAllText(logFilePath, line + Environment.NewLine);
+            }
+        }
+        catch
+        {
+            // Avoid crashing the server due to logging failures.
+        }
     }
 }
 
@@ -357,8 +603,21 @@ public class AppConfig
     public ServerConfig Server = new ServerConfig();
     public CameraConfig Camera = new CameraConfig();
     public RecordingConfig Recording = new RecordingConfig();
+    public FtpConfig Ftp = new FtpConfig();
 }
 
 public class ServerConfig { public string Host = "localhost"; public int Port = 5000; }
 public class CameraConfig { public string DeviceName = "Integrated Webcam"; }
 public class RecordingConfig { public string OutputDirectory = @"C:\videos"; }
+public class FtpConfig
+{
+    public bool Enabled = false;
+    public string Host = string.Empty;
+    public int Port = 21;
+    public string Username = "anonymous";
+    public string Password = string.Empty;
+    public string RemoteDirectory = string.Empty;
+    public bool UseSsl = false;
+    public int CheckIntervalMinutes = 5;
+    public int TimeoutSeconds = 15;
+}

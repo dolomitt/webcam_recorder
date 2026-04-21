@@ -131,6 +131,24 @@ Edit `appsettings.json`:
 dotnet build webcam_recorder.sln -nologo
 ```
 
+## Build Installer (EXE)
+
+This repository includes an Inno Setup installer definition at `installer\webcam_recorder.iss` and a helper script:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-installer.ps1 -Version 1.0.0
+```
+
+Output installer location:
+
+`installer\dist\webcam_recorder-setup-<version>.exe`
+
+Notes:
+
+- Requires Inno Setup 6 (`ISCC.exe`) installed on the build machine.
+- The installer includes the built `net452` app files and `appsettings.json`.
+- During install, a .NET Framework 4.5.2+ check is enforced.
+
 ---
 
 ## Run Server
