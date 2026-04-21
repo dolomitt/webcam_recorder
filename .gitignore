@@ -11,6 +11,8 @@ obj/
 .vs/
 .vscode/
 
+tmp_build
+
 # Logs and temp
 *.log
 *.tmp

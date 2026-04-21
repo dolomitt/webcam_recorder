@@ -5,6 +5,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Net;
+using System.ServiceProcess;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -31,34 +32,118 @@ public class Program
     static Task ftpSyncTask;
     static readonly object logSync = new object();
     static string logFilePath;
+    static CancellationTokenSource serverCts;
+    static Task listenerLoopTask;
+    static readonly object lifecycleSync = new object();
+    static bool hostStarted;
 
     public static void Main(string[] args)
     {
-        RunAsync().GetAwaiter().GetResult();
+        if (ShouldRunAsService(args))
+        {
+            ServiceBase.Run(new WebcamRecorderService());
+            return;
+        }
+
+        RunConsoleAsync().GetAwaiter().GetResult();
     }
 
-    static async Task RunAsync()
+    static bool ShouldRunAsService(string[] args)
     {
-        InitializeLogging();
-        config = LoadConfig("appsettings.json");
-        var prefix = string.Format("http://{0}:{1}/", config.Server.Host, config.Server.Port);
+        if (args != null)
+        {
+            foreach (var arg in args)
+            {
+                if (string.Equals(arg, "--service", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+        }
 
-        listener = new HttpListener();
-        listener.Prefixes.Add(prefix);
-        listener.Start();
-        StartFtpSyncLoop();
+        return !Environment.UserInteractive;
+    }
 
+    static async Task RunConsoleAsync()
+    {
+        var done = new TaskCompletionSource<bool>();
         Console.CancelKeyPress += delegate(object sender, ConsoleCancelEventArgs e)
         {
             e.Cancel = true;
-            StopFtpSyncLoop();
-            StopCapture();
-            try { listener.Stop(); } catch { }
+            StopHost();
+            done.TrySetResult(true);
         };
 
-        Log("Server running on {0}", prefix);
+        StartHost();
+        Log("Press Ctrl+C to stop.");
+        await done.Task;
+    }
 
-        while (true)
+    internal static void StartHost()
+    {
+        lock (lifecycleSync)
+        {
+            if (hostStarted) return;
+
+            InitializeLogging();
+            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            var configPath = Path.Combine(baseDir, "appsettings.json");
+            config = LoadConfig(configPath);
+            var prefix = string.Format("http://{0}:{1}/", config.Server.Host, config.Server.Port);
+
+            listener = new HttpListener();
+            listener.Prefixes.Add(prefix);
+            listener.Start();
+
+            serverCts = new CancellationTokenSource();
+            listenerLoopTask = Task.Run(() => ListenLoopAsync(serverCts.Token));
+            StartFtpSyncLoop();
+
+            hostStarted = true;
+            Log("Server running on {0}", prefix);
+        }
+    }
+
+    internal static void StopHost()
+    {
+        lock (lifecycleSync)
+        {
+            if (!hostStarted) return;
+
+            StopFtpSyncLoop();
+            StopCapture();
+
+            if (serverCts != null)
+            {
+                try { serverCts.Cancel(); } catch { }
+            }
+
+            if (listener != null)
+            {
+                try { listener.Stop(); } catch { }
+                try { listener.Close(); } catch { }
+                listener = null;
+            }
+
+            if (listenerLoopTask != null)
+            {
+                try { listenerLoopTask.Wait(TimeSpan.FromSeconds(5)); } catch { }
+                listenerLoopTask = null;
+            }
+
+            if (serverCts != null)
+            {
+                serverCts.Dispose();
+                serverCts = null;
+            }
+
+            hostStarted = false;
+        }
+    }
+
+    static async Task ListenLoopAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
         {
             HttpListenerContext context;
             try
@@ -387,7 +472,25 @@ public class Program
             if (IsActiveRecordingFile(localFile)) continue;
 
             var fileName = Path.GetFileName(localFile);
-            if (remoteFiles.Contains(fileName)) continue;
+            if (remoteFiles.Contains(fileName))
+            {
+                try
+                {
+                    long remoteSize;
+                    var exists = TryGetRemoteFileSize(fileName, out remoteSize);
+                    var localSize = new FileInfo(localFile).Length;
+                    if (exists && remoteSize == localSize)
+                    {
+                        continue;
+                    }
+
+                    Log("FTP sync: remote size mismatch for {0} (local={1}, remote={2}), re-uploading.", fileName, localSize, remoteSize);
+                }
+                catch (Exception ex)
+                {
+                    Log("FTP sync: size check failed for {0} ({1}), re-uploading.", fileName, ex.Message);
+                }
+            }
 
             try
             {
@@ -402,6 +505,54 @@ public class Program
         }
 
         Log("FTP sync cycle complete. Uploaded {0} file(s).", uploadedCount);
+    }
+
+    static bool TryGetRemoteFileSize(string remoteFileName, out long size)
+    {
+        size = -1;
+        try
+        {
+            var request = CreateFtpRequest(remoteFileName, WebRequestMethods.Ftp.GetFileSize);
+            using (var response = (FtpWebResponse)request.GetResponse())
+            {
+                size = response.ContentLength;
+                if (size < 0)
+                {
+                    var status = response.StatusDescription ?? string.Empty;
+                    var parts = status.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length >= 2)
+                    {
+                        long parsed;
+                        if (long.TryParse(parts[1], out parsed))
+                        {
+                            size = parsed;
+                        }
+                    }
+                }
+                return true;
+            }
+        }
+        catch (WebException ex)
+        {
+            var ftpResponse = ex.Response as FtpWebResponse;
+            if (ftpResponse != null)
+            {
+                try
+                {
+                    if (ftpResponse.StatusCode == FtpStatusCode.ActionNotTakenFileUnavailable ||
+                        ftpResponse.StatusCode == FtpStatusCode.ActionNotTakenFilenameNotAllowed)
+                    {
+                        return false;
+                    }
+                }
+                finally
+                {
+                    ftpResponse.Close();
+                }
+            }
+
+            throw;
+        }
     }
 
     static bool IsActiveRecordingFile(string path)
@@ -620,4 +771,31 @@ public class FtpConfig
     public bool UseSsl = false;
     public int CheckIntervalMinutes = 5;
     public int TimeoutSeconds = 15;
+}
+
+public class WebcamRecorderService : ServiceBase
+{
+    public WebcamRecorderService()
+    {
+        ServiceName = "webcam_recorder";
+        CanStop = true;
+        CanShutdown = true;
+        AutoLog = false;
+    }
+
+    protected override void OnStart(string[] args)
+    {
+        Program.StartHost();
+    }
+
+    protected override void OnStop()
+    {
+        Program.StopHost();
+    }
+
+    protected override void OnShutdown()
+    {
+        Program.StopHost();
+        base.OnShutdown();
+    }
 }

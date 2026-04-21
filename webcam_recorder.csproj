@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <Reference Include="System.Web.Extensions" />
+    <Reference Include="System.ServiceProcess" />
     <!-- Keep server project isolated from the sample client subfolder -->
     <Compile Remove="SampleClient\**\*.cs" />
   </ItemGroup>

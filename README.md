@@ -131,7 +131,12 @@ Edit `appsettings.json`:
 dotnet build webcam_recorder.sln -nologo
 ```
 
-## Build Installer (EXE)
+### Packaging options (important)
+
+- **ZIP + native Windows service (recommended for your target machine flow):** uses `scripts\build-zip.ps1` and **does not require ISCC/Inno Setup**.
+- **EXE installer (optional):** uses `scripts\build-installer.ps1` and **does require ISCC**.
+
+## Build Installer (EXE, optional)
 
 This repository includes an Inno Setup installer definition at `installer\webcam_recorder.iss` and a helper script:
 
@@ -148,6 +153,82 @@ Notes:
 - Requires Inno Setup 6 (`ISCC.exe`) installed on the build machine.
 - The installer includes the built `net452` app files and `appsettings.json`.
 - During install, a .NET Framework 4.5.2+ check is enforced.
+
+---
+
+## Build Portable ZIP (for target machine)
+
+If you want a copyable deployment package (instead of the EXE installer), build a ZIP that contains:
+
+- main app binaries
+- `SampleClient` binaries (ready-to-run)
+- default `appsettings.json`
+- service helper scripts
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-zip.ps1 -Version 1.0.0
+```
+
+Output ZIP location:
+
+`installer\dist\webcam_recorder-ntservice-<version>.zip`
+
+Inside the ZIP, sample client is located under:
+
+`SampleClient\SampleClient.exe`
+
+---
+
+## Install as Windows NT Service (native)
+
+This build supports running directly as a native Windows service (no NSSM required).
+
+### 1) Prepare target folder
+
+1. Copy ZIP to target machine.
+2. Extract to a folder, for example:
+
+`C:\Apps\webcam_recorder`
+
+### 2) Configure appsettings
+
+Edit `appsettings.json` in the extracted folder.
+
+Set at least:
+
+- `Server.Host` and `Server.Port`
+- `Camera.DeviceName`
+- `Recording.OutputDirectory`
+
+### 3) Install service
+
+Run an **elevated PowerShell** and execute:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-ntservice.ps1 `
+  -InstallDir "C:\Apps\webcam_recorder" `
+  -ServiceName "webcam_recorder" `
+  -DisplayName "Webcam Recorder" `
+  -Description "HTTP webcam recorder service"
+```
+
+The script creates an auto-start service using:
+
+`"C:\Apps\webcam_recorder\webcam_recorder.exe" --service`
+
+### 4) Start / verify
+
+```powershell
+sc.exe start webcam_recorder
+sc.exe query webcam_recorder
+```
+
+### 5) Remove service (if needed)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-ntservice.ps1 `
+  -ServiceName "webcam_recorder"
+```
 
 ---
 
