@@ -27,3 +27,9 @@ Desktop.ini
 TestResults/
 *.trx
 coverage/
+
+# Packaged release artifacts
+installer/dist/
+
+# Generated installer stage builds
+installer/stage/build-*/
