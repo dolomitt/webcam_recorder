@@ -196,6 +196,7 @@ Notes:
 - `fileSize` is sent in KB
 - `duration` is sent in seconds
 - If the callback fails, the application logs the failure and continues
+- After the FTP copy is confirmed, the local `.mp4` file is deleted automatically
 
 ---
 
@@ -432,3 +433,7 @@ Current unit tests cover:
   - Confirm FTP upload succeeds
   - Confirm `Notification.BaseUrl` is set
   - Check the log file configured by `FileLogging.FilePath`
+
+- **Local video file disappeared after upload**
+  - This is expected behavior
+  - Once the FTP copy is confirmed, the local `.mp4` file is deleted automatically

@@ -124,6 +124,9 @@ public class FtpVideoSync
                 var localSize = new FileInfo(localFile).Length;
                 if (exists && remoteSize == localSize)
                 {
+                    Log("FTP sync: confirmed remote copy for {0}; deleting local file.", remoteFileName);
+                    NotifyFileUploaded(localFile, remoteFileName);
+                    DeleteLocalFile(localFile, remoteFileName);
                     continue;
                 }
 
@@ -140,6 +143,7 @@ public class FtpVideoSync
                 uploadedCount++;
                 Log("FTP sync: uploaded {0}", remoteFileName);
                 NotifyFileUploaded(localFile, remoteFileName);
+                DeleteLocalFile(localFile, remoteFileName);
             }
             catch (Exception ex)
             {
@@ -328,6 +332,21 @@ public class FtpVideoSync
         catch (Exception ex)
         {
             Log("FTP sync: upload callback failed for {0} ({1})", remoteFileName, ex.Message);
+        }
+    }
+
+    void DeleteLocalFile(string localPath, string remoteFileName)
+    {
+        try
+        {
+            if (!File.Exists(localPath)) return;
+
+            File.Delete(localPath);
+            Log("FTP sync: deleted local file {0} after remote confirmation.", remoteFileName);
+        }
+        catch (Exception ex)
+        {
+            Log("FTP sync: failed deleting local file {0} ({1})", localPath, ex.Message);
         }
     }
 }
