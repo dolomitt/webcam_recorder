@@ -11,6 +11,9 @@
     <Reference Include="System.ServiceProcess" />
     <!-- Keep server project isolated from the sample client subfolder -->
     <Compile Remove="SampleClient\**\*.cs" />
+    <Compile Remove="webcam_recorder.Tests\**\*.cs" />
+    <EmbeddedResource Remove="webcam_recorder.Tests\**\*" />
+    <None Remove="webcam_recorder.Tests\**\*" />
   </ItemGroup>
 
   <ItemGroup>
@@ -22,6 +25,12 @@
   <ItemGroup>
     <PackageReference Include="Accord.Video.FFMPEG" Version="3.8.0" />
     <PackageReference Include="AForge.Video.DirectShow" Version="2.2.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>webcam_recorder.Tests</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
 
 </Project>

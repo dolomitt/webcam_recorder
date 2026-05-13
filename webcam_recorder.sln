@@ -6,6 +6,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "webcam_recorder", "webcam_r
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SampleClient", "SampleClient\SampleClient.csproj", "{9DECDD0B-8602-805B-690A-8FD665464CBB}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "webcam_recorder.Tests", "webcam_recorder.Tests\webcam_recorder.Tests.csproj", "{5BE21A0E-6BF0-4F10-B3D2-4A4F48DE0943}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -20,6 +22,10 @@ Global
 		{9DECDD0B-8602-805B-690A-8FD665464CBB}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{9DECDD0B-8602-805B-690A-8FD665464CBB}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{9DECDD0B-8602-805B-690A-8FD665464CBB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5BE21A0E-6BF0-4F10-B3D2-4A4F48DE0943}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5BE21A0E-6BF0-4F10-B3D2-4A4F48DE0943}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5BE21A0E-6BF0-4F10-B3D2-4A4F48DE0943}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5BE21A0E-6BF0-4F10-B3D2-4A4F48DE0943}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

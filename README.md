@@ -5,14 +5,21 @@ Simple command-line HTTP webcam service in C# with live preview and MP4 recordin
 ## Features
 
 - `POST /start` to start recording webcam video
-- `POST /stop` to stop recording
+- `POST /stop` to stop recording (returns an error if nothing is recording)
 - `GET /stream/{id}` to view live MJPEG preview while recording
 - `GET /file/{id}` to download/open saved MP4 recording
+- Configurable file logging path via `FileLogging.FilePath`
+- Optional FTP upload of completed MP4 files
+- Optional post-upload callback to an external web server for video evidence registration
 - JSON config for:
   - server host/port
   - camera device name
   - output directory
+  - logging file path
+  - FTP upload settings
+  - callback base URL
 - Sample client app included (`SampleClient`)
+- MSTest unit tests included (`webcam_recorder.Tests`)
 
 ---
 
@@ -61,6 +68,9 @@ Edit `appsettings.json` and set:
 - `Server.Host` and `Server.Port`
 - `Camera.DeviceName` (your webcam device name)
 - `Recording.OutputDirectory` (where MP4 files are saved)
+- `FileLogging.FilePath` (where the application log file is written)
+- `Ftp.*` if you want automatic FTP upload
+- `Notification.BaseUrl` if you want a callback after FTP upload
 
 ### 5) Run the server
 
@@ -109,10 +119,30 @@ Edit `appsettings.json`:
     "Port": 5001
   },
   "Camera": {
-    "DeviceName": "Integrated Webcam"
+    "DeviceName": "Integrated Webcam",
+    "Width": 1280,
+    "Height": 720
   },
   "Recording": {
-    "OutputDirectory": "C:\\videos"
+    "OutputDirectory": "C:\\videos",
+    "FrameRate": 15
+  },
+  "FileLogging": {
+    "FilePath": "logs\\server_run.log"
+  },
+  "Notification": {
+    "BaseUrl": "http://localhost:8080"
+  },
+  "Ftp": {
+    "Enabled": false,
+    "Host": "127.0.0.1",
+    "Port": 21,
+    "Username": "anonymous",
+    "Password": "",
+    "RemoteDirectory": "videos",
+    "UseSsl": false,
+    "CheckIntervalMinutes": 5,
+    "TimeoutSeconds": 15
   }
 }
 ```
@@ -120,8 +150,52 @@ Edit `appsettings.json`:
 ### Notes
 
 - `Camera.DeviceName` should match your DirectShow camera name. If not found, the first available camera is used.
+- `Camera.Width` and `Camera.Height` are optional. If the exact resolution is unavailable, the camera default is used.
 - If a port is busy, change `Server.Port`.
 - Recordings are saved to `Recording.OutputDirectory` with `.mp4` extension.
+- `FileLogging.FilePath` may be relative to the application folder or an absolute path.
+- The application still accepts legacy `Logging.FilePath`, but `FileLogging.FilePath` is the preferred setting.
+- `Notification.BaseUrl` is only used after a file has been uploaded to FTP successfully.
+- The callback URL is built as:
+  - `{Notification.BaseUrl}/request-register/videoEvidence/save`
+- `Notification.BaseUrl` should therefore contain only the server/base URL, not the full API path.
+
+### FTP upload and notification flow
+
+When FTP upload is enabled:
+
+1. A recording is created locally in `Recording.OutputDirectory`
+2. `POST /stop` stops the recording and queues notification metadata
+3. The background FTP sync uploads the file
+4. After a successful FTP upload, the app sends a callback to:
+
+`/request-register/videoEvidence/save`
+
+Payload format:
+
+```json
+{
+  "applicationId": "060065912",
+  "videoList": [
+    {
+      "videoPath": "/videos/060065912",
+      "videoFormat": "mp4",
+      "fileName": "060065912_video001",
+      "fileSize": 500,
+      "duration": 800
+    }
+  ]
+}
+```
+
+Notes:
+
+- `applicationId` is derived from the recording ID prefix before `_`
+- `videoPath` is the final FTP directory path
+- `fileName` is sent without extension
+- `fileSize` is sent in KB
+- `duration` is sent in seconds
+- If the callback fails, the application logs the failure and continues
 
 ---
 
@@ -199,6 +273,8 @@ Set at least:
 - `Server.Host` and `Server.Port`
 - `Camera.DeviceName`
 - `Recording.OutputDirectory`
+- `FileLogging.FilePath`
+- `Ftp.*` and `Notification.BaseUrl` if you want post-upload notification support
 
 ### 3) Install service
 
@@ -270,10 +346,16 @@ Success response (example):
 
 **POST** `/stop`
 
-Response:
+Success response:
 
 ```json
 { "status": "stopped" }
+```
+
+If no recording is currently active, the server returns HTTP 500, for example:
+
+```json
+{ "error": "No recording is currently in progress" }
 ```
 
 ### Stream live preview
@@ -314,6 +396,24 @@ dotnet run --project SampleClient\SampleClient.csproj -- stop
 
 ---
 
+## Tests
+
+Run the unit tests with:
+
+```bat
+dotnet test webcam_recorder.sln
+```
+
+Current unit tests cover:
+
+- config loading for `FileLogging.FilePath`
+- fallback support for legacy `Logging.FilePath`
+- video evidence callback URL generation
+- FTP remote video directory generation
+- application ID extraction from recording IDs
+
+---
+
 ## Troubleshooting
 
 - **Port conflict**
@@ -322,3 +422,13 @@ dotnet run --project SampleClient\SampleClient.csproj -- stop
 
 - **No webcam found**
   - Ensure a camera is connected and recognized by Windows.
+
+- **`/stop` returns an error**
+  - Error: `No recording is currently in progress`
+  - Fix: call `POST /start` first, then call `POST /stop` only while a recording is active.
+
+- **Callback not being sent**
+  - Confirm `Ftp.Enabled = true`
+  - Confirm FTP upload succeeds
+  - Confirm `Notification.BaseUrl` is set
+  - Check the log file configured by `FileLogging.FilePath`

@@ -334,7 +334,7 @@ public class Program
         return Path.Combine(config.Recording.OutputDirectory, applicationId, id + ".mp4");
     }
 
-    static string GetApplicationId(string id)
+    internal static string GetApplicationId(string id)
     {
         if (string.IsNullOrWhiteSpace(id)) return string.Empty;
 
@@ -697,13 +697,23 @@ public class Program
 
     static string BuildVideoEvidenceUrl()
     {
-        return (config.Notification.BaseUrl ?? string.Empty).TrimEnd('/') + VideoEvidenceSavePath;
+        return BuildVideoEvidenceUrl(config.Notification.BaseUrl);
+    }
+
+    internal static string BuildVideoEvidenceUrl(string baseUrl)
+    {
+        return (baseUrl ?? string.Empty).TrimEnd('/') + VideoEvidenceSavePath;
     }
 
     static string BuildRemoteVideoDirectory(string remoteFileName)
     {
+        return BuildRemoteVideoDirectory(config.Ftp.RemoteDirectory, remoteFileName);
+    }
+
+    internal static string BuildRemoteVideoDirectory(string ftpRemoteDirectory, string remoteFileName)
+    {
         var segments = new List<string>();
-        var remoteRoot = (config.Ftp.RemoteDirectory ?? string.Empty).Replace('\\', '/').Trim('/');
+        var remoteRoot = (ftpRemoteDirectory ?? string.Empty).Replace('\\', '/').Trim('/');
         if (!string.IsNullOrWhiteSpace(remoteRoot))
         {
             segments.Add(remoteRoot);
@@ -769,7 +779,7 @@ public class Program
     static object Dict(string k1, object v1) { return new Dictionary<string, object> { { k1, v1 } }; }
     static object Dict(string k1, object v1, string k2, object v2, string k3, object v3) { return new Dictionary<string, object> { { k1, v1 }, { k2, v2 }, { k3, v3 } }; }
 
-    static AppConfig LoadConfig(string path)
+    internal static AppConfig LoadConfig(string path)
     {
         var serializer = new JavaScriptSerializer();
         var root = serializer.Deserialize<Dictionary<string, object>>(File.ReadAllText(path));
