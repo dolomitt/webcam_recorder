@@ -27,15 +27,19 @@ public class Program
     static VideoFileWriter videoWriter;
     static int frameWidth;
     static int frameHeight;
-    static int frameRate = 30;
-    static CancellationTokenSource ftpSyncCts;
-    static Task ftpSyncTask;
+    static int frameRate;
+    static long nextRecordingTick;
+    static FtpVideoSync ftpVideoSync;
     static readonly object logSync = new object();
     static string logFilePath;
     static CancellationTokenSource serverCts;
     static Task listenerLoopTask;
     static readonly object lifecycleSync = new object();
+    static readonly object notificationSync = new object();
+    static readonly Dictionary<string, PendingVideoNotification> pendingNotifications = new Dictionary<string, PendingVideoNotification>(StringComparer.OrdinalIgnoreCase);
     static bool hostStarted;
+    static DateTime recordingStartedUtc;
+    const string VideoEvidenceSavePath = "/request-register/videoEvidence/save";
 
     public static void Main(string[] args)
     {
@@ -85,10 +89,11 @@ public class Program
         {
             if (hostStarted) return;
 
-            InitializeLogging();
             var baseDir = AppDomain.CurrentDomain.BaseDirectory;
             var configPath = Path.Combine(baseDir, "appsettings.json");
             config = LoadConfig(configPath);
+            InitializeLogging(config.Logging.FilePath);
+            frameRate = config.Recording.FrameRate;
             var prefix = string.Format("http://{0}:{1}/", config.Server.Host, config.Server.Port);
 
             listener = new HttpListener();
@@ -111,7 +116,7 @@ public class Program
             if (!hostStarted) return;
 
             StopFtpSyncLoop();
-            StopCapture();
+            QueuePendingNotification(StopCapture());
 
             if (serverCts != null)
             {
@@ -164,6 +169,7 @@ public class Program
         var req = context.Request;
         var res = context.Response;
 
+        // Minimal HTTP API: start/stop recording, stream the live preview, or download an MP4.
         if (req.HttpMethod == "POST" && req.Url.AbsolutePath == "/start")
         {
             var body = new StreamReader(req.InputStream, req.ContentEncoding).ReadToEnd();
@@ -185,17 +191,27 @@ public class Program
                 return;
             }
 
-            foreach (var invalid in Path.GetInvalidFileNameChars())
+            if (!IsValidRecordingId(id))
             {
-                if (id.IndexOf(invalid) >= 0)
-                {
-                    await WriteJsonAsync(res, 400, Dict("error", "'id' contains invalid filename characters"));
-                    return;
-                }
+                await WriteJsonAsync(res, 400, Dict("error", "'id' contains invalid filename characters"));
+                return;
             }
 
-            Directory.CreateDirectory(config.Recording.OutputDirectory);
-            var recordingPath = Path.Combine(config.Recording.OutputDirectory, id + ".mp4");
+            var applicationId = GetApplicationId(id);
+            if (string.IsNullOrWhiteSpace(applicationId))
+            {
+                await WriteJsonAsync(res, 400, Dict("error", "'id' must start with an application id"));
+                return;
+            }
+
+            var recordingPath = BuildRecordingPath(id);
+            Directory.CreateDirectory(Path.GetDirectoryName(recordingPath));
+
+            if (isRecording)
+            {
+                await WriteJsonAsync(res, 500, Dict("error", "Recording already in progress"));
+                return;
+            }
 
             try
             {
@@ -213,7 +229,14 @@ public class Program
 
         if (req.HttpMethod == "POST" && req.Url.AbsolutePath == "/stop")
         {
-            StopCapture();
+            if (!isRecording)
+            {
+                await WriteJsonAsync(res, 500, Dict("error", "No recording is currently in progress"));
+                return;
+            }
+
+            var stoppedRecording = StopCapture();
+            QueuePendingNotification(stoppedRecording);
             await WriteJsonAsync(res, 200, Dict("status", "stopped"));
             return;
         }
@@ -265,7 +288,13 @@ public class Program
         if (req.HttpMethod == "GET" && req.Url.AbsolutePath.StartsWith("/file/", StringComparison.OrdinalIgnoreCase))
         {
             var id = req.Url.AbsolutePath.Substring("/file/".Length);
-            var path = Path.Combine(config.Recording.OutputDirectory, id + ".mp4");
+            if (!IsValidRecordingId(id))
+            {
+                await WriteJsonAsync(res, 400, Dict("error", "'id' contains invalid filename characters"));
+                return;
+            }
+
+            var path = BuildRecordingPath(id);
             if (!File.Exists(path))
             {
                 await WriteJsonAsync(res, 404, Dict("error", "Recording not found"));
@@ -286,9 +315,43 @@ public class Program
         await WriteJsonAsync(res, 404, Dict("error", "Not found"));
     }
 
+    static bool IsValidRecordingId(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id)) return false;
+
+        foreach (var invalid in Path.GetInvalidFileNameChars())
+        {
+            if (id.IndexOf(invalid) >= 0) return false;
+        }
+
+        return true;
+    }
+
+    static string BuildRecordingPath(string id)
+    {
+        // The application id is the first segment before "_"; each application gets its own folder.
+        var applicationId = GetApplicationId(id);
+        return Path.Combine(config.Recording.OutputDirectory, applicationId, id + ".mp4");
+    }
+
+    static string GetApplicationId(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id)) return string.Empty;
+
+        var underscoreIndex = id.IndexOf('_');
+        if (underscoreIndex < 0) return id;
+        return id.Substring(0, underscoreIndex);
+    }
+
     static void StartCapture(string id, string recordingPath)
     {
+        if (isRecording)
+        {
+            throw new InvalidOperationException("Recording already in progress");
+        }
+
         StopCapture();
+        nextRecordingTick = 0;
 
         var devices = new FilterInfoCollection(FilterCategory.VideoInputDevice);
         if (devices.Count == 0)
@@ -308,11 +371,13 @@ public class Program
         if (selected == null) selected = devices[0];
 
         videoDevice = new VideoCaptureDevice(selected.MonikerString);
+        ApplyConfiguredResolution(videoDevice);
         videoDevice.NewFrame += delegate(object sender, NewFrameEventArgs eventArgs)
         {
             var frame = (Bitmap)eventArgs.Frame.Clone();
             lock (sync)
             {
+                // The writer is opened lazily once the camera delivers the first frame dimensions.
                 if (frameWidth == 0 || frameHeight == 0)
                 {
                     frameWidth = frame.Width;
@@ -324,7 +389,7 @@ public class Program
                 if (isRecording)
                 {
                     EnsureWriter();
-                    if (videoWriter != null)
+                    if (videoWriter != null && ShouldWriteCurrentFrame())
                     {
                         videoWriter.WriteVideoFrame(latestFrame);
                     }
@@ -336,14 +401,42 @@ public class Program
         activeId = id;
         currentRecordingPath = recordingPath;
         isRecording = true;
+        recordingStartedUtc = DateTime.UtcNow;
         videoDevice.Start();
     }
 
-    static void StopCapture()
+    static void ApplyConfiguredResolution(VideoCaptureDevice device)
     {
+        if (config.Camera.Width <= 0 || config.Camera.Height <= 0) return;
+
+        // DirectShow only accepts advertised capability objects, so find the exact configured size.
+        foreach (var capability in device.VideoCapabilities)
+        {
+            if (capability.FrameSize.Width == config.Camera.Width &&
+                capability.FrameSize.Height == config.Camera.Height)
+            {
+                device.VideoResolution = capability;
+                Log("Camera resolution set to {0}x{1}.", config.Camera.Width, config.Camera.Height);
+                return;
+            }
+        }
+
+        Log("Configured camera resolution {0}x{1} is unavailable. Using camera default.",
+            config.Camera.Width,
+            config.Camera.Height);
+    }
+
+    static PendingVideoNotification StopCapture()
+    {
+        var hadRecording = isRecording || !string.IsNullOrWhiteSpace(activeId) || !string.IsNullOrWhiteSpace(currentRecordingPath);
+        var stoppedId = activeId;
+        var stoppedPath = currentRecordingPath;
+        var startedAtUtc = recordingStartedUtc;
+
         isRecording = false;
         activeId = string.Empty;
         currentRecordingPath = string.Empty;
+        recordingStartedUtc = DateTime.MinValue;
 
         if (videoDevice != null)
         {
@@ -369,6 +462,7 @@ public class Program
 
         frameWidth = 0;
         frameHeight = 0;
+        nextRecordingTick = 0;
 
         lock (sync)
         {
@@ -378,181 +472,56 @@ public class Program
                 latestFrame = null;
             }
         }
+
+        if (!hadRecording || string.IsNullOrWhiteSpace(stoppedPath))
+        {
+            return null;
+        }
+
+        var durationSeconds = 0L;
+        if (startedAtUtc != DateTime.MinValue)
+        {
+            var elapsed = DateTime.UtcNow - startedAtUtc;
+            if (elapsed < TimeSpan.Zero) elapsed = TimeSpan.Zero;
+            durationSeconds = (long)Math.Ceiling(elapsed.TotalSeconds);
+        }
+
+        var fileSizeKb = 0L;
+        if (File.Exists(stoppedPath))
+        {
+            var fileInfo = new FileInfo(stoppedPath);
+            fileSizeKb = (long)Math.Ceiling(fileInfo.Length / 1024d);
+        }
+
+        var videoFormat = Path.GetExtension(stoppedPath) ?? string.Empty;
+        if (videoFormat.StartsWith("."))
+        {
+            videoFormat = videoFormat.Substring(1);
+        }
+
+        return new PendingVideoNotification
+        {
+            ApplicationId = GetApplicationId(stoppedId),
+            LocalPath = stoppedPath,
+            FileName = Path.GetFileNameWithoutExtension(stoppedPath),
+            VideoFormat = string.IsNullOrWhiteSpace(videoFormat) ? "mp4" : videoFormat,
+            FileSizeKb = fileSizeKb,
+            DurationSeconds = durationSeconds
+        };
     }
 
     static void StartFtpSyncLoop()
     {
-        if (config.Ftp == null || !config.Ftp.Enabled)
-        {
-            Log("FTP sync disabled.");
-            return;
-        }
-        if (string.IsNullOrWhiteSpace(config.Ftp.Host))
-        {
-            Log("FTP sync disabled: Ftp.Host is empty.");
-            return;
-        }
-
-        ftpSyncCts = new CancellationTokenSource();
-        ftpSyncTask = Task.Run(() => RunFtpSyncLoopAsync(ftpSyncCts.Token));
-        Log("FTP sync enabled. Checking every {0} minute(s).", config.Ftp.CheckIntervalMinutes);
+        // FTP sync owns its own background loop; Program only supplies config and the active-file guard.
+        ftpVideoSync = new FtpVideoSync(config.Ftp, config.Recording.OutputDirectory, IsActiveRecordingFile, OnFileUploadedToFtp, Log);
+        ftpVideoSync.Start();
     }
 
     static void StopFtpSyncLoop()
     {
-        if (ftpSyncCts == null) return;
-
-        try
-        {
-            ftpSyncCts.Cancel();
-            if (ftpSyncTask != null)
-            {
-                ftpSyncTask.Wait(TimeSpan.FromSeconds(5));
-            }
-        }
-        catch { }
-        finally
-        {
-            ftpSyncCts.Dispose();
-            ftpSyncCts = null;
-            ftpSyncTask = null;
-        }
-    }
-
-    static async Task RunFtpSyncLoopAsync(CancellationToken token)
-    {
-        var intervalMinutes = config.Ftp.CheckIntervalMinutes < 1 ? 5 : config.Ftp.CheckIntervalMinutes;
-        var delay = TimeSpan.FromMinutes(intervalMinutes);
-
-        while (!token.IsCancellationRequested)
-        {
-            try
-            {
-                SyncVideosToFtp();
-            }
-            catch (Exception ex)
-            {
-                Log("FTP sync cycle failed: {0}", ex.Message);
-            }
-
-            try
-            {
-                await Task.Delay(delay, token);
-            }
-            catch (TaskCanceledException)
-            {
-                break;
-            }
-        }
-    }
-
-    static void SyncVideosToFtp()
-    {
-        if (!Directory.Exists(config.Recording.OutputDirectory))
-        {
-            Log("FTP sync: local output directory not found: {0}", config.Recording.OutputDirectory);
-            return;
-        }
-
-        HashSet<string> remoteFiles;
-        try
-        {
-            remoteFiles = ListRemoteFiles();
-        }
-        catch (Exception ex)
-        {
-            Log("FTP sync: server unavailable ({0})", ex.Message);
-            return;
-        }
-
-        var localFiles = Directory.GetFiles(config.Recording.OutputDirectory, "*.mp4");
-        var uploadedCount = 0;
-        foreach (var localFile in localFiles)
-        {
-            if (IsActiveRecordingFile(localFile)) continue;
-
-            var fileName = Path.GetFileName(localFile);
-            if (remoteFiles.Contains(fileName))
-            {
-                try
-                {
-                    long remoteSize;
-                    var exists = TryGetRemoteFileSize(fileName, out remoteSize);
-                    var localSize = new FileInfo(localFile).Length;
-                    if (exists && remoteSize == localSize)
-                    {
-                        continue;
-                    }
-
-                    Log("FTP sync: remote size mismatch for {0} (local={1}, remote={2}), re-uploading.", fileName, localSize, remoteSize);
-                }
-                catch (Exception ex)
-                {
-                    Log("FTP sync: size check failed for {0} ({1}), re-uploading.", fileName, ex.Message);
-                }
-            }
-
-            try
-            {
-                UploadFileToFtp(localFile, fileName);
-                uploadedCount++;
-                Log("FTP sync: uploaded {0}", fileName);
-            }
-            catch (Exception ex)
-            {
-                Log("FTP sync: failed uploading {0} ({1})", fileName, ex.Message);
-            }
-        }
-
-        Log("FTP sync cycle complete. Uploaded {0} file(s).", uploadedCount);
-    }
-
-    static bool TryGetRemoteFileSize(string remoteFileName, out long size)
-    {
-        size = -1;
-        try
-        {
-            var request = CreateFtpRequest(remoteFileName, WebRequestMethods.Ftp.GetFileSize);
-            using (var response = (FtpWebResponse)request.GetResponse())
-            {
-                size = response.ContentLength;
-                if (size < 0)
-                {
-                    var status = response.StatusDescription ?? string.Empty;
-                    var parts = status.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-                    if (parts.Length >= 2)
-                    {
-                        long parsed;
-                        if (long.TryParse(parts[1], out parsed))
-                        {
-                            size = parsed;
-                        }
-                    }
-                }
-                return true;
-            }
-        }
-        catch (WebException ex)
-        {
-            var ftpResponse = ex.Response as FtpWebResponse;
-            if (ftpResponse != null)
-            {
-                try
-                {
-                    if (ftpResponse.StatusCode == FtpStatusCode.ActionNotTakenFileUnavailable ||
-                        ftpResponse.StatusCode == FtpStatusCode.ActionNotTakenFilenameNotAllowed)
-                    {
-                        return false;
-                    }
-                }
-                finally
-                {
-                    ftpResponse.Close();
-                }
-            }
-
-            throw;
-        }
+        if (ftpVideoSync == null) return;
+        ftpVideoSync.Stop();
+        ftpVideoSync = null;
     }
 
     static bool IsActiveRecordingFile(string path)
@@ -565,76 +534,195 @@ public class Program
             StringComparison.OrdinalIgnoreCase);
     }
 
-    static HashSet<string> ListRemoteFiles()
+    static void QueuePendingNotification(PendingVideoNotification notification)
     {
-        var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var request = CreateFtpRequest(string.Empty, WebRequestMethods.Ftp.ListDirectory);
-        using (var response = (FtpWebResponse)request.GetResponse())
-        using (var stream = response.GetResponseStream())
-        using (var reader = new StreamReader(stream))
+        if (notification == null || string.IsNullOrWhiteSpace(notification.LocalPath)) return;
+
+        var normalizedPath = NormalizePath(notification.LocalPath);
+        lock (notificationSync)
         {
-            string line;
-            while ((line = reader.ReadLine()) != null)
+            pendingNotifications[normalizedPath] = notification;
+        }
+
+        Log("Queued video-evidence notification for {0}", notification.FileName);
+    }
+
+    static void OnFileUploadedToFtp(string localPath, string remoteFileName)
+    {
+        if (string.IsNullOrWhiteSpace(config.Notification.BaseUrl))
+        {
+            return;
+        }
+
+        var notification = DequeuePendingNotification(localPath) ?? CreateFallbackNotification(localPath);
+        if (notification == null)
+        {
+            Log("Video-evidence notification skipped: no metadata found for {0}", localPath);
+            return;
+        }
+
+        notification.VideoPath = BuildRemoteVideoDirectory(remoteFileName);
+        SendVideoEvidenceNotification(notification);
+    }
+
+    static PendingVideoNotification DequeuePendingNotification(string localPath)
+    {
+        if (string.IsNullOrWhiteSpace(localPath)) return null;
+
+        var normalizedPath = NormalizePath(localPath);
+        lock (notificationSync)
+        {
+            PendingVideoNotification notification;
+            if (pendingNotifications.TryGetValue(normalizedPath, out notification))
             {
-                line = line.Trim();
-                if (line.Length > 0)
+                pendingNotifications.Remove(normalizedPath);
+                return notification;
+            }
+        }
+
+        return null;
+    }
+
+    static PendingVideoNotification CreateFallbackNotification(string localPath)
+    {
+        if (string.IsNullOrWhiteSpace(localPath) || !File.Exists(localPath)) return null;
+
+        var fileInfo = new FileInfo(localPath);
+        var extension = fileInfo.Extension ?? string.Empty;
+        if (extension.StartsWith("."))
+        {
+            extension = extension.Substring(1);
+        }
+
+        Log("No in-memory metadata found for {0}; using file metadata fallback for notification.", localPath);
+        return new PendingVideoNotification
+        {
+            ApplicationId = GetApplicationId(Path.GetFileNameWithoutExtension(localPath)),
+            LocalPath = localPath,
+            FileName = Path.GetFileNameWithoutExtension(localPath),
+            VideoFormat = string.IsNullOrWhiteSpace(extension) ? "mp4" : extension,
+            FileSizeKb = (long)Math.Ceiling(fileInfo.Length / 1024d),
+            DurationSeconds = 0
+        };
+    }
+
+    static void SendVideoEvidenceNotification(PendingVideoNotification notification)
+    {
+        if (notification == null) return;
+        if (string.IsNullOrWhiteSpace(config.Notification.BaseUrl))
+        {
+            Log("Video-evidence notification skipped: Notification.BaseUrl is empty.");
+            return;
+        }
+
+        var url = BuildVideoEvidenceUrl();
+        var payload = new Dictionary<string, object>
+        {
+            { "applicationId", notification.ApplicationId },
+            {
+                "videoList",
+                new object[]
                 {
-                    files.Add(line);
+                    new Dictionary<string, object>
+                    {
+                        { "videoPath", notification.VideoPath },
+                        { "videoFormat", notification.VideoFormat },
+                        { "fileName", notification.FileName },
+                        { "fileSize", notification.FileSizeKb },
+                        { "duration", notification.DurationSeconds }
+                    }
                 }
             }
-        }
-        return files;
-    }
+        };
 
-    static void UploadFileToFtp(string localPath, string remoteFileName)
-    {
-        var request = CreateFtpRequest(remoteFileName, WebRequestMethods.Ftp.UploadFile);
-        var bytes = File.ReadAllBytes(localPath);
-        request.ContentLength = bytes.Length;
-        using (var requestStream = request.GetRequestStream())
+        var serializer = new JavaScriptSerializer();
+        var requestBody = serializer.Serialize(payload);
+        var requestBytes = Encoding.UTF8.GetBytes(requestBody);
+
+        try
         {
-            requestStream.Write(bytes, 0, bytes.Length);
-        }
-        using (var response = (FtpWebResponse)request.GetResponse())
-        {
-            if ((int)response.StatusCode >= 400)
+            var request = (HttpWebRequest)WebRequest.Create(url);
+            request.Method = "POST";
+            request.ContentType = "application/json";
+            request.Timeout = 15000;
+            request.ReadWriteTimeout = 15000;
+            request.ContentLength = requestBytes.Length;
+
+            using (var requestStream = request.GetRequestStream())
             {
-                throw new InvalidOperationException(response.StatusDescription);
+                requestStream.Write(requestBytes, 0, requestBytes.Length);
+            }
+
+            using (var response = (HttpWebResponse)request.GetResponse())
+            {
+                Log("Video-evidence notification sent for {0} to {1} (HTTP {2}).", notification.FileName, url, (int)response.StatusCode);
             }
         }
+        catch (WebException ex)
+        {
+            var details = ex.Message;
+            var response = ex.Response as HttpWebResponse;
+            if (response != null)
+            {
+                details = string.Format("HTTP {0} {1}", (int)response.StatusCode, response.StatusDescription);
+                try
+                {
+                    using (var stream = response.GetResponseStream())
+                    using (var reader = new StreamReader(stream))
+                    {
+                        var responseBody = reader.ReadToEnd();
+                        if (!string.IsNullOrWhiteSpace(responseBody))
+                        {
+                            details += ": " + responseBody;
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore response-body read failures and keep the status detail.
+                }
+                finally
+                {
+                    response.Close();
+                }
+            }
+
+            Log("Video-evidence notification failed for {0}: {1}", notification.FileName, details);
+        }
+        catch (Exception ex)
+        {
+            Log("Video-evidence notification failed for {0}: {1}", notification.FileName, ex.Message);
+        }
     }
 
-    static FtpWebRequest CreateFtpRequest(string remoteFileName, string method)
+    static string BuildVideoEvidenceUrl()
     {
-        var uri = BuildFtpUri(remoteFileName);
-        var request = (FtpWebRequest)WebRequest.Create(uri);
-        request.Method = method;
-        request.Credentials = new NetworkCredential(config.Ftp.Username, config.Ftp.Password);
-        request.EnableSsl = config.Ftp.UseSsl;
-        request.UseBinary = true;
-        request.UsePassive = true;
-        request.KeepAlive = false;
-        request.Timeout = config.Ftp.TimeoutSeconds * 1000;
-        request.ReadWriteTimeout = config.Ftp.TimeoutSeconds * 1000;
-        return request;
+        return (config.Notification.BaseUrl ?? string.Empty).TrimEnd('/') + VideoEvidenceSavePath;
     }
 
-    static string BuildFtpUri(string remoteFileName)
+    static string BuildRemoteVideoDirectory(string remoteFileName)
     {
-        var basePath = (config.Ftp.RemoteDirectory ?? string.Empty).Trim();
-        basePath = basePath.Trim('/');
-        var cleanFileName = (remoteFileName ?? string.Empty).Trim().Trim('/');
+        var segments = new List<string>();
+        var remoteRoot = (config.Ftp.RemoteDirectory ?? string.Empty).Replace('\\', '/').Trim('/');
+        if (!string.IsNullOrWhiteSpace(remoteRoot))
+        {
+            segments.Add(remoteRoot);
+        }
 
-        var uri = string.Format("ftp://{0}:{1}", config.Ftp.Host, config.Ftp.Port);
-        if (!string.IsNullOrEmpty(basePath))
+        var directoryName = Path.GetDirectoryName((remoteFileName ?? string.Empty).Replace('/', Path.DirectorySeparatorChar));
+        var remoteDirectory = (directoryName ?? string.Empty).Replace('\\', '/').Trim('/');
+        if (!string.IsNullOrWhiteSpace(remoteDirectory))
         {
-            uri += "/" + basePath;
+            segments.Add(remoteDirectory);
         }
-        if (!string.IsNullOrEmpty(cleanFileName))
-        {
-            uri += "/" + cleanFileName;
-        }
-        return uri;
+
+        if (segments.Count == 0) return "/";
+        return "/" + string.Join("/", segments.ToArray());
+    }
+
+    static string NormalizePath(string path)
+    {
+        return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
     }
 
     static void EnsureWriter()
@@ -648,6 +736,23 @@ public class Program
             }
         }
         catch { }
+    }
+
+    static bool ShouldWriteCurrentFrame()
+    {
+        if (frameRate <= 0) return true;
+
+        // Some webcams deliver frames faster than the target recording rate; throttle writes by time.
+        var now = Stopwatch.GetTimestamp();
+        var frameIntervalTicks = Math.Max(1L, Stopwatch.Frequency / Math.Max(1, frameRate));
+
+        if (nextRecordingTick == 0 || now >= nextRecordingTick)
+        {
+            nextRecordingTick = now + frameIntervalTicks;
+            return true;
+        }
+
+        return false;
     }
 
     static async Task WriteJsonAsync(HttpListenerResponse response, int statusCode, object payload)
@@ -672,7 +777,11 @@ public class Program
         cfg.Server.Host = GetString(root, "Server", "Host", "localhost");
         cfg.Server.Port = GetInt(root, "Server", "Port", 5000);
         cfg.Camera.DeviceName = GetString(root, "Camera", "DeviceName", "Integrated Webcam");
+        cfg.Camera.Width = GetInt(root, "Camera", "Width", 0);
+        cfg.Camera.Height = GetInt(root, "Camera", "Height", 0);
         cfg.Recording.OutputDirectory = GetString(root, "Recording", "OutputDirectory", @"C:\videos");
+        cfg.Recording.FrameRate = GetInt(root, "Recording", "FrameRate", 15);
+        cfg.Logging.FilePath = GetString(root, "Logging", "FilePath", Path.Combine("logs", "server_run.log"));
         cfg.Ftp.Enabled = GetBool(root, "Ftp", "Enabled", false);
         cfg.Ftp.Host = GetString(root, "Ftp", "Host", string.Empty);
         cfg.Ftp.Port = GetInt(root, "Ftp", "Port", 21);
@@ -682,6 +791,7 @@ public class Program
         cfg.Ftp.UseSsl = GetBool(root, "Ftp", "UseSsl", false);
         cfg.Ftp.CheckIntervalMinutes = GetInt(root, "Ftp", "CheckIntervalMinutes", 5);
         cfg.Ftp.TimeoutSeconds = GetInt(root, "Ftp", "TimeoutSeconds", 15);
+        cfg.Notification.BaseUrl = GetString(root, "Notification", "BaseUrl", string.Empty);
         return cfg;
     }
 
@@ -720,12 +830,18 @@ public class Program
         return null;
     }
 
-    static void InitializeLogging()
+    static void InitializeLogging(string configuredPath)
     {
         var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-        var logDir = Path.Combine(baseDir, "logs");
+        var path = string.IsNullOrWhiteSpace(configuredPath) ? Path.Combine("logs", "server_run.log") : configuredPath;
+        if (!Path.IsPathRooted(path))
+        {
+            path = Path.Combine(baseDir, path);
+        }
+
+        var logDir = Path.GetDirectoryName(path);
         Directory.CreateDirectory(logDir);
-        logFilePath = Path.Combine(logDir, "server_run.log");
+        logFilePath = path;
     }
 
     static void Log(string format, params object[] args)
@@ -754,12 +870,24 @@ public class AppConfig
     public ServerConfig Server = new ServerConfig();
     public CameraConfig Camera = new CameraConfig();
     public RecordingConfig Recording = new RecordingConfig();
+    public LoggingConfig Logging = new LoggingConfig();
     public FtpConfig Ftp = new FtpConfig();
+    public NotificationConfig Notification = new NotificationConfig();
 }
 
 public class ServerConfig { public string Host = "localhost"; public int Port = 5000; }
-public class CameraConfig { public string DeviceName = "Integrated Webcam"; }
-public class RecordingConfig { public string OutputDirectory = @"C:\videos"; }
+public class CameraConfig
+{
+    public string DeviceName = "Integrated Webcam";
+    public int Width = 0;
+    public int Height = 0;
+}
+public class RecordingConfig
+{
+    public string OutputDirectory = @"C:\videos";
+    public int FrameRate = 15;
+}
+public class LoggingConfig { public string FilePath = Path.Combine("logs", "server_run.log"); }
 public class FtpConfig
 {
     public bool Enabled = false;
@@ -771,6 +899,18 @@ public class FtpConfig
     public bool UseSsl = false;
     public int CheckIntervalMinutes = 5;
     public int TimeoutSeconds = 15;
+}
+public class NotificationConfig { public string BaseUrl = string.Empty; }
+
+public class PendingVideoNotification
+{
+    public string ApplicationId = string.Empty;
+    public string LocalPath = string.Empty;
+    public string VideoPath = string.Empty;
+    public string VideoFormat = "mp4";
+    public string FileName = string.Empty;
+    public long FileSizeKb;
+    public long DurationSeconds;
 }
 
 public class WebcamRecorderService : ServiceBase
