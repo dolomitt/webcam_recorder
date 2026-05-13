@@ -92,7 +92,7 @@ public class Program
             var baseDir = AppDomain.CurrentDomain.BaseDirectory;
             var configPath = Path.Combine(baseDir, "appsettings.json");
             config = LoadConfig(configPath);
-            InitializeLogging(config.Logging.FilePath);
+            InitializeLogging(config.FileLogging.FilePath);
             frameRate = config.Recording.FrameRate;
             var prefix = string.Format("http://{0}:{1}/", config.Server.Host, config.Server.Port);
 
@@ -781,7 +781,8 @@ public class Program
         cfg.Camera.Height = GetInt(root, "Camera", "Height", 0);
         cfg.Recording.OutputDirectory = GetString(root, "Recording", "OutputDirectory", @"C:\videos");
         cfg.Recording.FrameRate = GetInt(root, "Recording", "FrameRate", 15);
-        cfg.Logging.FilePath = GetString(root, "Logging", "FilePath", Path.Combine("logs", "server_run.log"));
+        cfg.FileLogging.FilePath = GetString(root, "FileLogging", "FilePath",
+            GetString(root, "Logging", "FilePath", Path.Combine("logs", "server_run.log")));
         cfg.Ftp.Enabled = GetBool(root, "Ftp", "Enabled", false);
         cfg.Ftp.Host = GetString(root, "Ftp", "Host", string.Empty);
         cfg.Ftp.Port = GetInt(root, "Ftp", "Port", 21);
@@ -870,7 +871,7 @@ public class AppConfig
     public ServerConfig Server = new ServerConfig();
     public CameraConfig Camera = new CameraConfig();
     public RecordingConfig Recording = new RecordingConfig();
-    public LoggingConfig Logging = new LoggingConfig();
+    public FileLoggingConfig FileLogging = new FileLoggingConfig();
     public FtpConfig Ftp = new FtpConfig();
     public NotificationConfig Notification = new NotificationConfig();
 }
@@ -887,7 +888,7 @@ public class RecordingConfig
     public string OutputDirectory = @"C:\videos";
     public int FrameRate = 15;
 }
-public class LoggingConfig { public string FilePath = Path.Combine("logs", "server_run.log"); }
+public class FileLoggingConfig { public string FilePath = Path.Combine("logs", "server_run.log"); }
 public class FtpConfig
 {
     public bool Enabled = false;

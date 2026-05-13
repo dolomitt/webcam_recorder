@@ -10,6 +10,7 @@ obj/
 # IDE/editor folders
 .vs/
 .vscode/
+.clineignore
 
 tmp_build
 
