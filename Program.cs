@@ -32,6 +32,8 @@ public class Program
     static FtpVideoSync ftpVideoSync;
     static readonly object logSync = new object();
     static string logFilePath;
+    static long logMaxSizeBytes;
+    static int logMaxRetainedFiles;
     static CancellationTokenSource serverCts;
     static Task listenerLoopTask;
     static readonly object lifecycleSync = new object();
@@ -92,7 +94,8 @@ public class Program
             var baseDir = AppDomain.CurrentDomain.BaseDirectory;
             var configPath = Path.Combine(baseDir, "appsettings.json");
             config = LoadConfig(configPath);
-            InitializeLogging(config.FileLogging.FilePath);
+            InitializeLogging(config.FileLogging);
+            ApplySecuritySettings();
             frameRate = config.Recording.FrameRate;
             var prefix = string.Format("http://{0}:{1}/", config.Server.Host, config.Server.Port);
 
@@ -793,6 +796,8 @@ public class Program
         cfg.Recording.FrameRate = GetInt(root, "Recording", "FrameRate", 15);
         cfg.FileLogging.FilePath = GetString(root, "FileLogging", "FilePath",
             GetString(root, "Logging", "FilePath", Path.Combine("logs", "server_run.log")));
+        cfg.FileLogging.MaxSizeBytes = GetLong(root, "FileLogging", "MaxSizeBytes", 10 * 1024 * 1024);
+        cfg.FileLogging.MaxRetainedFiles = GetInt(root, "FileLogging", "MaxRetainedFiles", 5);
         cfg.Ftp.Enabled = GetBool(root, "Ftp", "Enabled", false);
         cfg.Ftp.Host = GetString(root, "Ftp", "Host", string.Empty);
         cfg.Ftp.Port = GetInt(root, "Ftp", "Port", 21);
@@ -803,6 +808,7 @@ public class Program
         cfg.Ftp.CheckIntervalMinutes = GetInt(root, "Ftp", "CheckIntervalMinutes", 5);
         cfg.Ftp.TimeoutSeconds = GetInt(root, "Ftp", "TimeoutSeconds", 15);
         cfg.Notification.BaseUrl = GetString(root, "Notification", "BaseUrl", string.Empty);
+        cfg.Security.IgnoreSslCertificateErrors = GetBool(root, "Security", "IgnoreSslCertificateErrors", false);
         return cfg;
     }
 
@@ -824,6 +830,17 @@ public class Program
         return defaultValue;
     }
 
+    static long GetLong(Dictionary<string, object> root, string section, string key, long defaultValue)
+    {
+        var sec = GetSection(root, section);
+        if (sec != null && sec.ContainsKey(key) && sec[key] != null)
+        {
+            long n;
+            if (long.TryParse(Convert.ToString(sec[key]), out n)) return n;
+        }
+        return defaultValue;
+    }
+
     static bool GetBool(Dictionary<string, object> root, string section, string key, bool defaultValue)
     {
         var sec = GetSection(root, section);
@@ -841,9 +858,10 @@ public class Program
         return null;
     }
 
-    static void InitializeLogging(string configuredPath)
+    static void InitializeLogging(FileLoggingConfig loggingConfig)
     {
         var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+        var configuredPath = loggingConfig == null ? null : loggingConfig.FilePath;
         var path = string.IsNullOrWhiteSpace(configuredPath) ? Path.Combine("logs", "server_run.log") : configuredPath;
         if (!Path.IsPathRooted(path))
         {
@@ -853,6 +871,20 @@ public class Program
         var logDir = Path.GetDirectoryName(path);
         Directory.CreateDirectory(logDir);
         logFilePath = path;
+        logMaxSizeBytes = loggingConfig == null ? 10 * 1024 * 1024 : loggingConfig.MaxSizeBytes;
+        logMaxRetainedFiles = loggingConfig == null ? 5 : loggingConfig.MaxRetainedFiles;
+    }
+
+    static void ApplySecuritySettings()
+    {
+        if (config.Security.IgnoreSslCertificateErrors)
+        {
+            ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
+            Log("WARNING: SSL/TLS certificate validation is disabled by configuration.");
+            return;
+        }
+
+        ServicePointManager.ServerCertificateValidationCallback = null;
     }
 
     static void Log(string format, params object[] args)
@@ -866,13 +898,65 @@ public class Program
         {
             lock (logSync)
             {
-                File.AppendAllText(logFilePath, line + Environment.NewLine);
+                var fileLine = line + Environment.NewLine;
+                RotateLogIfNeeded(Encoding.UTF8.GetByteCount(fileLine));
+                File.AppendAllText(logFilePath, fileLine);
             }
         }
         catch
         {
             // Avoid crashing the server due to logging failures.
         }
+    }
+
+    static void RotateLogIfNeeded(long incomingBytes)
+    {
+        if (logMaxSizeBytes <= 0) return;
+        if (string.IsNullOrWhiteSpace(logFilePath)) return;
+        if (!File.Exists(logFilePath)) return;
+
+        var currentSize = new FileInfo(logFilePath).Length;
+        if (currentSize + incomingBytes <= logMaxSizeBytes) return;
+
+        if (logMaxRetainedFiles <= 0)
+        {
+            File.Delete(logFilePath);
+            return;
+        }
+
+        var oldestPath = GetRotatedLogPath(logMaxRetainedFiles);
+        if (File.Exists(oldestPath))
+        {
+            File.Delete(oldestPath);
+        }
+
+        for (var i = logMaxRetainedFiles - 1; i >= 1; i--)
+        {
+            var sourcePath = GetRotatedLogPath(i);
+            if (!File.Exists(sourcePath)) continue;
+
+            var targetPath = GetRotatedLogPath(i + 1);
+            if (File.Exists(targetPath))
+            {
+                File.Delete(targetPath);
+            }
+            File.Move(sourcePath, targetPath);
+        }
+
+        var firstRotatedPath = GetRotatedLogPath(1);
+        if (File.Exists(firstRotatedPath))
+        {
+            File.Delete(firstRotatedPath);
+        }
+        File.Move(logFilePath, firstRotatedPath);
+    }
+
+    static string GetRotatedLogPath(int index)
+    {
+        var directory = Path.GetDirectoryName(logFilePath);
+        var fileName = Path.GetFileNameWithoutExtension(logFilePath);
+        var extension = Path.GetExtension(logFilePath);
+        return Path.Combine(directory, string.Format("{0}.{1}{2}", fileName, index, extension));
     }
 }
 
@@ -884,6 +968,7 @@ public class AppConfig
     public FileLoggingConfig FileLogging = new FileLoggingConfig();
     public FtpConfig Ftp = new FtpConfig();
     public NotificationConfig Notification = new NotificationConfig();
+    public SecurityConfig Security = new SecurityConfig();
 }
 
 public class ServerConfig { public string Host = "localhost"; public int Port = 5000; }
@@ -898,7 +983,13 @@ public class RecordingConfig
     public string OutputDirectory = @"C:\videos";
     public int FrameRate = 15;
 }
-public class FileLoggingConfig { public string FilePath = Path.Combine("logs", "server_run.log"); }
+public class FileLoggingConfig
+{
+    public string FilePath = Path.Combine("logs", "server_run.log");
+    public long MaxSizeBytes = 10 * 1024 * 1024;
+    public int MaxRetainedFiles = 5;
+}
+public class SecurityConfig { public bool IgnoreSslCertificateErrors = false; }
 public class FtpConfig
 {
     public bool Enabled = false;

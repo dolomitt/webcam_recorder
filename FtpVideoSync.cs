@@ -41,7 +41,13 @@ public class FtpVideoSync
 
         cts = new CancellationTokenSource();
         syncTask = Task.Run(() => RunAsync(cts.Token));
-        Log("FTP sync enabled. Checking every {0} minute(s).", config.CheckIntervalMinutes);
+        Log("FTP sync enabled. Host={0}, Port={1}, RemoteDirectory={2}, UseSsl={3}, LocalDirectory={4}, CheckIntervalMinutes={5}.",
+            config.Host,
+            config.Port,
+            string.IsNullOrWhiteSpace(config.RemoteDirectory) ? "/" : config.RemoteDirectory,
+            config.UseSsl,
+            outputDirectory,
+            config.CheckIntervalMinutes);
     }
 
     public void Stop()
@@ -50,6 +56,7 @@ public class FtpVideoSync
 
         try
         {
+            Log("FTP sync stopping.");
             cts.Cancel();
             if (syncTask != null)
             {
@@ -62,6 +69,7 @@ public class FtpVideoSync
             cts.Dispose();
             cts = null;
             syncTask = null;
+            Log("FTP sync stopped.");
         }
     }
 
@@ -94,6 +102,8 @@ public class FtpVideoSync
 
     void SyncVideos()
     {
+        Log("FTP sync cycle starting. LocalDirectory={0}", outputDirectory);
+
         if (!Directory.Exists(outputDirectory))
         {
             Log("FTP sync: local output directory not found: {0}", outputDirectory);
@@ -102,7 +112,8 @@ public class FtpVideoSync
 
         try
         {
-            ListRemoteFiles();
+            var remoteFiles = ListRemoteFiles();
+            Log("FTP sync: server reachable. Remote root contains {0} item(s).", remoteFiles.Count);
         }
         catch (Exception ex)
         {
@@ -111,26 +122,45 @@ public class FtpVideoSync
         }
 
         var localFiles = Directory.GetFiles(outputDirectory, "*.mp4", SearchOption.AllDirectories);
+        Log("FTP sync: found {0} local mp4 file(s) to inspect.", localFiles.Length);
         var uploadedCount = 0;
+        var skippedActiveCount = 0;
+        var alreadyRemoteCount = 0;
+        var failedCount = 0;
         foreach (var localFile in localFiles)
         {
-            if (isActiveRecordingFile != null && isActiveRecordingFile(localFile)) continue;
-
             var remoteFileName = GetRecordingRelativePath(localFile);
+            var localSize = new FileInfo(localFile).Length;
+            Log("FTP sync: inspecting {0} ({1} bytes).", remoteFileName, localSize);
+
+            if (isActiveRecordingFile != null && isActiveRecordingFile(localFile))
+            {
+                skippedActiveCount++;
+                Log("FTP sync: skipping active recording {0}.", remoteFileName);
+                continue;
+            }
+
             try
             {
                 long remoteSize;
                 var exists = TryGetRemoteFileSize(remoteFileName, out remoteSize);
-                var localSize = new FileInfo(localFile).Length;
                 if (exists && remoteSize == localSize)
                 {
                     Log("FTP sync: confirmed remote copy for {0}; deleting local file.", remoteFileName);
                     NotifyFileUploaded(localFile, remoteFileName);
                     DeleteLocalFile(localFile, remoteFileName);
+                    alreadyRemoteCount++;
                     continue;
                 }
 
-                Log("FTP sync: remote size mismatch for {0} (local={1}, remote={2}), re-uploading.", remoteFileName, localSize, remoteSize);
+                if (exists)
+                {
+                    Log("FTP sync: remote size mismatch for {0} (local={1}, remote={2}), re-uploading.", remoteFileName, localSize, remoteSize);
+                }
+                else
+                {
+                    Log("FTP sync: remote file not found for {0}; uploading.", remoteFileName);
+                }
             }
             catch (Exception ex)
             {
@@ -147,11 +177,17 @@ public class FtpVideoSync
             }
             catch (Exception ex)
             {
+                failedCount++;
                 Log("FTP sync: failed uploading {0} ({1})", remoteFileName, ex.Message);
             }
         }
 
-        Log("FTP sync cycle complete. Uploaded {0} file(s).", uploadedCount);
+        Log("FTP sync cycle complete. Uploaded={0}, AlreadyRemote={1}, SkippedActive={2}, Failed={3}, Inspected={4}.",
+            uploadedCount,
+            alreadyRemoteCount,
+            skippedActiveCount,
+            failedCount,
+            localFiles.Length);
     }
 
     bool TryGetRemoteFileSize(string remoteFileName, out long size)
@@ -159,6 +195,7 @@ public class FtpVideoSync
         size = -1;
         try
         {
+            Log("FTP sync: checking remote size for {0}.", remoteFileName);
             var request = CreateRequest(remoteFileName, WebRequestMethods.Ftp.GetFileSize);
             using (var response = (FtpWebResponse)request.GetResponse())
             {
@@ -176,6 +213,7 @@ public class FtpVideoSync
                         }
                     }
                 }
+                Log("FTP sync: remote size for {0} is {1} bytes.", remoteFileName, size);
                 return true;
             }
         }
@@ -189,6 +227,7 @@ public class FtpVideoSync
                     if (ftpResponse.StatusCode == FtpStatusCode.ActionNotTakenFileUnavailable ||
                         ftpResponse.StatusCode == FtpStatusCode.ActionNotTakenFilenameNotAllowed)
                     {
+                        Log("FTP sync: remote file unavailable for {0} ({1}).", remoteFileName, ftpResponse.StatusCode);
                         return false;
                     }
                 }
@@ -219,6 +258,7 @@ public class FtpVideoSync
     HashSet<string> ListRemoteFiles()
     {
         var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        Log("FTP sync: listing remote root.");
         var request = CreateRequest(string.Empty, WebRequestMethods.Ftp.ListDirectory);
         using (var response = (FtpWebResponse)request.GetResponse())
         using (var stream = response.GetResponseStream())
@@ -242,6 +282,7 @@ public class FtpVideoSync
         EnsureRemoteDirectories(remoteFileName);
         var request = CreateRequest(remoteFileName, WebRequestMethods.Ftp.UploadFile);
         var bytes = File.ReadAllBytes(localPath);
+        Log("FTP sync: uploading {0} ({1} bytes).", remoteFileName, bytes.Length);
         request.ContentLength = bytes.Length;
         using (var requestStream = request.GetRequestStream())
         {
@@ -253,6 +294,8 @@ public class FtpVideoSync
             {
                 throw new InvalidOperationException(response.StatusDescription);
             }
+
+            Log("FTP sync: upload response for {0}: {1} {2}", remoteFileName, response.StatusCode, response.StatusDescription);
         }
     }
 
@@ -268,14 +311,16 @@ public class FtpVideoSync
             currentPath = string.IsNullOrEmpty(currentPath) ? parts[i] : currentPath + "/" + parts[i];
             try
             {
+                Log("FTP sync: ensuring remote directory {0}.", currentPath);
                 var request = CreateRequest(currentPath, WebRequestMethods.Ftp.MakeDirectory);
                 using (var response = (FtpWebResponse)request.GetResponse())
                 {
+                    Log("FTP sync: remote directory {0} mkdir response: {1} {2}", currentPath, response.StatusCode, response.StatusDescription);
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // Directory may already exist or the server may not allow explicit mkdir checks.
+                Log("FTP sync: remote directory {0} not created or already exists ({1}).", currentPath, ex.Message);
             }
         }
     }

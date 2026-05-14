@@ -248,6 +248,12 @@ Output ZIP location:
 
 `installer\dist\webcam_recorder-ntservice-<version>.zip`
 
+Repository note:
+
+- `installer\dist\` contains generated packaging output and is intentionally ignored by Git.
+- `scripts\build-installer.ps1` also creates temporary stage folders under `installer\stage\build-*`; these generated folders are intentionally ignored by Git.
+- `installer\stage\appsettings.json` remains tracked as a template/reference file.
+
 Inside the ZIP, sample client is located under:
 
 `SampleClient\SampleClient.exe`
