@@ -23,6 +23,22 @@ Simple command-line HTTP webcam service in C# with live preview and MP4 recordin
 
 ---
 
+## Release Notes
+
+### 1.0.4
+
+- Changed video evidence notification `videoPath` to a UNC-style directory path using `Ftp.Host`, `Ftp.RemoteDirectory`, and `applicationId`.
+- Updated the default FTP remote directory example to `video_evidences`.
+
+### 1.0.3
+
+- Added configurable log rotation with `FileLogging.MaxSizeBytes` and `FileLogging.MaxRetainedFiles`.
+- Added more detailed FTP sync diagnostics for cycle start/end, remote checks, uploads, directory creation, skipped active recordings, and failures.
+- Added configurable SSL/TLS certificate validation bypass for controlled test environments via `Security.IgnoreSslCertificateErrors`.
+- Video evidence notification is sent after FTP confirms the recording is available remotely.
+
+---
+
 ## Requirements
 
 - Windows
@@ -139,7 +155,7 @@ Edit `appsettings.json`:
     "Port": 21,
     "Username": "anonymous",
     "Password": "",
-    "RemoteDirectory": "videos",
+    "RemoteDirectory": "video_evidences",
     "UseSsl": false,
     "CheckIntervalMinutes": 5,
     "TimeoutSeconds": 15
@@ -178,7 +194,7 @@ Payload format:
   "applicationId": "060065912",
   "videoList": [
     {
-      "videoPath": "/videos/060065912",
+      "videoPath": "\\\\127.0.0.1\\video_evidences\\060065912\\",
       "videoFormat": "mp4",
       "fileName": "060065912_video001",
       "fileSize": 500,
@@ -191,7 +207,7 @@ Payload format:
 Notes:
 
 - `applicationId` is derived from the recording ID prefix before `_`
-- `videoPath` is the final FTP directory path
+- `videoPath` is the final UNC-style video directory path: `\\{Ftp.Host}\{Ftp.RemoteDirectory}\{applicationId}\`
 - `fileName` is sent without extension
 - `fileSize` is sent in KB
 - `duration` is sent in seconds

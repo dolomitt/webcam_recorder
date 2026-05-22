@@ -564,7 +564,7 @@ public class Program
             return;
         }
 
-        notification.VideoPath = BuildRemoteVideoDirectory(remoteFileName);
+        notification.VideoPath = BuildRemoteVideoDirectory(notification.ApplicationId);
         SendVideoEvidenceNotification(notification);
     }
 
@@ -708,29 +708,34 @@ public class Program
         return (baseUrl ?? string.Empty).TrimEnd('/') + VideoEvidenceSavePath;
     }
 
-    static string BuildRemoteVideoDirectory(string remoteFileName)
+    static string BuildRemoteVideoDirectory(string applicationId)
     {
-        return BuildRemoteVideoDirectory(config.Ftp.RemoteDirectory, remoteFileName);
+        return BuildRemoteVideoDirectory(config.Ftp.Host, config.Ftp.RemoteDirectory, applicationId);
     }
 
-    internal static string BuildRemoteVideoDirectory(string ftpRemoteDirectory, string remoteFileName)
+    internal static string BuildRemoteVideoDirectory(string ftpHost, string ftpRemoteDirectory, string applicationId)
     {
         var segments = new List<string>();
+        var host = (ftpHost ?? string.Empty).Trim().Trim('\\', '/');
         var remoteRoot = (ftpRemoteDirectory ?? string.Empty).Replace('\\', '/').Trim('/');
         if (!string.IsNullOrWhiteSpace(remoteRoot))
         {
-            segments.Add(remoteRoot);
+            segments.AddRange(remoteRoot.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries));
         }
 
-        var directoryName = Path.GetDirectoryName((remoteFileName ?? string.Empty).Replace('/', Path.DirectorySeparatorChar));
-        var remoteDirectory = (directoryName ?? string.Empty).Replace('\\', '/').Trim('/');
-        if (!string.IsNullOrWhiteSpace(remoteDirectory))
+        var cleanApplicationId = (applicationId ?? string.Empty).Trim().Trim('\\', '/');
+        if (!string.IsNullOrWhiteSpace(cleanApplicationId))
         {
-            segments.Add(remoteDirectory);
+            segments.Add(cleanApplicationId);
         }
 
-        if (segments.Count == 0) return "/";
-        return "/" + string.Join("/", segments.ToArray());
+        var path = @"\\" + host;
+        if (segments.Count > 0)
+        {
+            path += @"\" + string.Join(@"\", segments.ToArray());
+        }
+
+        return path.TrimEnd('\\') + @"\";
     }
 
     static string NormalizePath(string path)

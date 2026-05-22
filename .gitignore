@@ -12,6 +12,8 @@ obj/
 .vscode/
 .clineignore
 
+*.lscache
+
 tmp_build
 
 # Logs and temp

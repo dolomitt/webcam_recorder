@@ -58,13 +58,13 @@ namespace webcam_recorder.Tests
         }
 
         [DataTestMethod]
-        [DataRow("videos", "060065912/video001.mp4", "/videos/060065912")]
-        [DataRow("videos", "video001.mp4", "/videos")]
-        [DataRow("", "060065912/video001.mp4", "/060065912")]
-        [DataRow("incoming/root", "060065912/video001.mp4", "/incoming/root/060065912")]
-        public void BuildRemoteVideoDirectory_Returns_Expected_Ftp_Directory(string ftpRemoteDirectory, string remoteFileName, string expected)
+        [DataRow("172.16.3.5", "video_evidences", "060065912", @"\\172.16.3.5\video_evidences\060065912\")]
+        [DataRow("172.16.3.5", "incoming/root", "060065912", @"\\172.16.3.5\incoming\root\060065912\")]
+        [DataRow("172.16.3.5", "", "060065912", @"\\172.16.3.5\060065912\")]
+        [DataRow("172.16.3.5", "video_evidences", "", @"\\172.16.3.5\video_evidences\")]
+        public void BuildRemoteVideoDirectory_Returns_Expected_Unc_Directory(string ftpHost, string ftpRemoteDirectory, string applicationId, string expected)
         {
-            var actual = Program.BuildRemoteVideoDirectory(ftpRemoteDirectory, remoteFileName);
+            var actual = Program.BuildRemoteVideoDirectory(ftpHost, ftpRemoteDirectory, applicationId);
 
             Assert.AreEqual(expected, actual);
         }
